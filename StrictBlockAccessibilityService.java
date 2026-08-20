@@ -1,7 +1,10 @@
 package com.kaua.ritmo;
 
 import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.content.Intent;
 import android.graphics.Rect;
+import android.os.Build;
 import android.provider.Settings;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -57,6 +60,35 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
 
     private long lastBlockedAt = 0L;
     private String lastBlockedDomain = "";
+
+    @Override
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+
+        try {
+            AccessibilityServiceInfo info = getServiceInfo();
+            if (info != null) {
+                info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
+                info.flags |= AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
+                info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+                info.notificationTimeout = 80;
+                setServiceInfo(info);
+            }
+        } catch (Exception ignored) {
+        }
+
+        startWatchdog();
+    }
+
+    private void startWatchdog() {
+        try {
+            Intent guard = new Intent(this, ProtectionWatchdogService.class)
+                    .setAction(ProtectionWatchdogService.ACTION_START);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(guard);
+            else startService(guard);
+        } catch (Exception ignored) {
+        }
+    }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
@@ -191,7 +223,7 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
 
         if (Settings.canDrawOverlays(this)) {
             try {
-                android.content.Intent overlay = new android.content.Intent(this, BlockedOverlayService.class);
+                Intent overlay = new Intent(this, BlockedOverlayService.class);
                 overlay.putExtra(BlockedOverlayService.EXTRA_DOMAIN, domain);
                 startService(overlay);
             } catch (Exception ignored) {}
@@ -199,6 +231,31 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
     }
 
     @Override
+    public boolean onUnbind(Intent intent) {
+        startWatchdog();
+        return true;
+    }
+
+    @Override
+    public void onRebind(Intent intent) {
+        super.onRebind(intent);
+        startWatchdog();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        startWatchdog();
+        super.onTaskRemoved(rootIntent);
+    }
+
+    @Override
+    public void onDestroy() {
+        startWatchdog();
+        super.onDestroy();
+    }
+
+    @Override
     public void onInterrupt() {
+        startWatchdog();
     }
 }

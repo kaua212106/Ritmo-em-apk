@@ -9,6 +9,7 @@ import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
@@ -41,6 +42,8 @@ public class MainActivity extends Activity {
     private static final int OVERLAY_REQUEST = 7003;
     private static final String CLOUD_PREFS = "ritmo_cloud";
     private static final String KEY_SYNC_ENABLED = "sync_enabled";
+    private static final String BG_PREFS = "ritmo_background";
+    private static final String KEY_BATTERY_PROMPTED = "battery_prompted";
 
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
@@ -185,6 +188,36 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {}
     }
 
+    private void ensureStrictWatchdogRunningIfNeeded() {
+        if (!isStrictAccessibilityEnabledInternal()) return;
+        try {
+            Intent guard = new Intent(this, ProtectionWatchdogService.class)
+                    .setAction(ProtectionWatchdogService.ACTION_START);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(guard);
+            else startService(guard);
+        } catch (Exception ignored) {}
+    }
+
+    private void requestBackgroundExemptionIfNeeded() {
+        if (!isStrictAccessibilityEnabledInternal()) return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+
+            SharedPreferences prefs = getSharedPreferences(BG_PREFS, Context.MODE_PRIVATE);
+            if (prefs.getBoolean(KEY_BATTERY_PROMPTED, false)) return;
+            prefs.edit().putBoolean(KEY_BATTERY_PROMPTED, true).apply();
+
+            Intent request = new Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())
+            );
+            startActivity(request);
+        } catch (Exception ignored) {}
+    }
+
     private void requestOverlayThenVpn() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
             try {
@@ -320,6 +353,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         ensureBlockerRunningIfNeeded();
+        ensureStrictWatchdogRunningIfNeeded();
+        requestBackgroundExemptionIfNeeded();
         refreshWebSoon();
     }
 
