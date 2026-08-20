@@ -2,14 +2,12 @@ package com.kaua.ritmo;
 
 import android.app.Activity;
 import android.content.Context;
-import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.PowerManager;
 import android.provider.Settings;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
@@ -42,8 +40,6 @@ public class MainActivity extends Activity {
     private static final int OVERLAY_REQUEST = 7003;
     private static final String CLOUD_PREFS = "ritmo_cloud";
     private static final String KEY_SYNC_ENABLED = "sync_enabled";
-    private static final String BG_PREFS = "ritmo_background";
-    private static final String KEY_BATTERY_PROMPTED = "battery_prompted";
 
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
@@ -181,40 +177,20 @@ public class MainActivity extends Activity {
 
     private void ensureBlockerRunningIfNeeded() {
         if (!BlocklistStore.isProtectionEnabled(this)) return;
-        if (DnsBlockVpnService.isRunningNow()) return;
         if (VpnService.prepare(this) != null) return;
         try {
             startVpnService();
         } catch (Exception ignored) {}
     }
 
-    private void ensureStrictWatchdogRunningIfNeeded() {
-        if (!isStrictAccessibilityEnabledInternal()) return;
+    private void rebuildVpnRoutesIfNeeded() {
+        if (!BlocklistStore.isProtectionEnabled(this)) return;
+        if (VpnService.prepare(this) != null) return;
         try {
-            Intent guard = new Intent(this, ProtectionWatchdogService.class)
-                    .setAction(ProtectionWatchdogService.ACTION_START);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(guard);
-            else startService(guard);
-        } catch (Exception ignored) {}
-    }
-
-    private void requestBackgroundExemptionIfNeeded() {
-        if (!isStrictAccessibilityEnabledInternal()) return;
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
-
-        try {
-            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
-
-            SharedPreferences prefs = getSharedPreferences(BG_PREFS, Context.MODE_PRIVATE);
-            if (prefs.getBoolean(KEY_BATTERY_PROMPTED, false)) return;
-            prefs.edit().putBoolean(KEY_BATTERY_PROMPTED, true).apply();
-
-            Intent request = new Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:" + getPackageName())
-            );
-            startActivity(request);
+            Intent intent = new Intent(this, DnsBlockVpnService.class)
+                    .setAction(DnsBlockVpnService.ACTION_REBUILD);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
+            else startService(intent);
         } catch (Exception ignored) {}
     }
 
@@ -239,43 +215,15 @@ public class MainActivity extends Activity {
     }
 
     private boolean isStrictAccessibilityEnabledInternal() {
-        try {
-            int enabled = Settings.Secure.getInt(
-                    getContentResolver(),
-                    Settings.Secure.ACCESSIBILITY_ENABLED,
-                    0
-            );
-            if (enabled != 1) return false;
-
-            String services = Settings.Secure.getString(
-                    getContentResolver(),
-                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-            );
-            if (services == null || services.isEmpty()) return false;
-
-            String expected = new ComponentName(
-                    this,
-                    StrictBlockAccessibilityService.class
-            ).flattenToString();
-
-            for (String service : services.split(":")) {
-                if (expected.equalsIgnoreCase(service)) return true;
-            }
-        } catch (Exception ignored) {}
         return false;
     }
 
     private void openAccessibilitySettingsInternal() {
-        try {
-            Toast.makeText(
-                    this,
-                    "Ative o serviço Ritmo - Modo rígido. Ele verifica a barra de endereço do navegador para reforçar o bloqueio.",
-                    Toast.LENGTH_LONG
-            ).show();
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-        } catch (Exception e) {
-            startActivity(new Intent(Settings.ACTION_SETTINGS));
-        }
+        Toast.makeText(
+                this,
+                "Esta versão não usa mais Acessibilidade. O bloqueio é feito somente pela VPN do Ritmo.",
+                Toast.LENGTH_LONG
+        ).show();
     }
 
     private void refreshWebSoon() {
@@ -343,6 +291,7 @@ public class MainActivity extends Activity {
                         }
                     }
                     BlocklistStore.replaceSites(this, sites);
+                    rebuildVpnRoutesIfNeeded();
                     refreshWebSoon();
                     cloudLoaded(true, true, appData == null ? "" : appData, BlocklistStore.getSites(this), "Dados carregados.");
                 })
@@ -353,8 +302,6 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         ensureBlockerRunningIfNeeded();
-        ensureStrictWatchdogRunningIfNeeded();
-        requestBackgroundExemptionIfNeeded();
         refreshWebSoon();
     }
 
@@ -515,7 +462,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean isVpnActive() {
-            return DnsBlockVpnService.isRunningNow() && BlocklistStore.isVpnActive(context);
+            return BlocklistStore.isVpnActive(context);
         }
 
         @JavascriptInterface
@@ -531,7 +478,10 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public boolean addBlockedSite(String value) {
             boolean ok = BlocklistStore.addSite(context, value);
-            if (ok) saveBlockedSitesInternal(false);
+            if (ok) {
+                saveBlockedSitesInternal(false);
+                rebuildVpnRoutesIfNeeded();
+            }
             refreshWebSoon();
             return ok;
         }
@@ -539,7 +489,10 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public boolean removeBlockedSite(String value) {
             boolean ok = BlocklistStore.removeSite(context, value);
-            if (ok) saveBlockedSitesInternal(false);
+            if (ok) {
+                saveBlockedSitesInternal(false);
+                rebuildVpnRoutesIfNeeded();
+            }
             refreshWebSoon();
             return ok;
         }
@@ -553,6 +506,7 @@ public class MainActivity extends Activity {
                     if (!array.isNull(i)) sites.add(array.optString(i, ""));
                 }
                 BlocklistStore.replaceSites(context, sites);
+                rebuildVpnRoutesIfNeeded();
                 refreshWebSoon();
                 if (syncCloud) saveBlockedSitesInternal(false);
             } catch (Exception ignored) {}

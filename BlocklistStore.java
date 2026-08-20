@@ -21,73 +21,106 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
+/**
+ * Armazenamento simples compartilhado entre o processo da interface e o
+ * processo :vpn. Os marcadores de proteção/atividade ficam em arquivos
+ * separados para evitar que um processo sobrescreva a lista do outro.
+ */
 public final class BlocklistStore {
     private static final String PREFS = "ritmo_blocker";
     private static final String KEY_SITES = "blocked_sites";
     private static final String KEY_ACTIVE = "vpn_active";
     private static final String KEY_PROTECTION_ENABLED = "protection_enabled";
-    private static final String STATE_FILE = "ritmo_blocker_state_v2.txt";
+
+    private static final String SITES_FILE = "ritmo_blocked_sites_v4.txt";
+    private static final String PROTECTION_FILE = "ritmo_protection_enabled_v4.flag";
+    private static final String ACTIVE_FILE = "ritmo_vpn_active_v4.flag";
+    private static final String MIGRATION_FILE = "ritmo_blocker_v4_migrated.flag";
 
     private BlocklistStore() {}
 
-    private static File stateFile(Context context) {
-        return new File(context.getApplicationContext().getFilesDir(), STATE_FILE);
+    private static File file(Context context, String name) {
+        return new File(context.getApplicationContext().getFilesDir(), name);
     }
 
-    private static final class State {
-        boolean protectionEnabled;
-        final Set<String> sites = new HashSet<>();
-    }
+    private static synchronized void ensureMigrated(Context context) {
+        File migrated = file(context, MIGRATION_FILE);
+        if (migrated.exists()) return;
 
-    private static State readState(Context context) {
-        File file = stateFile(context);
-        if (!file.exists()) return migrateFromPreferences(context);
+        Set<String> sites = new HashSet<>();
+        boolean protection = false;
 
-        State state = new State();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                new FileInputStream(file), StandardCharsets.UTF_8))) {
-            String line;
-            boolean first = true;
-            while ((line = reader.readLine()) != null) {
-                if (first) {
-                    first = false;
-                    state.protectionEnabled = "protection=1".equals(line.trim());
-                    continue;
+        // Primeiro tenta migrar o formato usado pelas versões V4/V5 anteriores.
+        for (String oldName : new String[]{"ritmo_blocker_state_v3.txt", "ritmo_blocker_state_v2.txt"}) {
+            File old = file(context, oldName);
+            if (!old.exists()) continue;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                    new FileInputStream(old), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String value = line.trim();
+                    if (value.startsWith("protection=")) {
+                        protection = "protection=1".equals(value);
+                    } else if (!value.startsWith("active=")) {
+                        String domain = normalizeDomain(value);
+                        if (domain != null) sites.add(domain);
+                    }
                 }
-                String domain = normalizeDomain(line);
-                if (domain != null) state.sites.add(domain);
-            }
-            return state;
-        } catch (Exception ignored) {
-            return migrateFromPreferences(context);
+                break;
+            } catch (Exception ignored) {}
         }
-    }
 
-    private static State migrateFromPreferences(Context context) {
+        // Preferences antigas servem como fallback e também preservam a lista
+        // caso o arquivo antigo não esteja disponível.
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        State state = new State();
-        state.protectionEnabled = sp.getBoolean(KEY_PROTECTION_ENABLED, false);
-        Set<String> raw = sp.getStringSet(KEY_SITES, Collections.emptySet());
-        if (raw != null) {
-            for (String value : raw) {
-                String domain = normalizeDomain(value);
-                if (domain != null) state.sites.add(domain);
+        if (sites.isEmpty()) {
+            Set<String> oldSites = sp.getStringSet(KEY_SITES, Collections.emptySet());
+            if (oldSites != null) {
+                for (String raw : oldSites) {
+                    String domain = normalizeDomain(raw);
+                    if (domain != null) sites.add(domain);
+                }
             }
         }
-        writeStateFile(context, state);
-        return state;
+        if (!protection) protection = sp.getBoolean(KEY_PROTECTION_ENABLED, false);
+
+        writeSites(context, sites);
+        setFlag(file(context, PROTECTION_FILE), protection);
+        setFlag(file(context, ACTIVE_FILE), false);
+        try { migrated.createNewFile(); } catch (Exception ignored) {}
+        mirrorPrefs(context, sites, protection, false);
     }
 
-    private static void writeStateFile(Context context, State state) {
-        File target = stateFile(context);
-        File tmp = new File(target.getParentFile(), STATE_FILE + ".tmp");
-        List<String> sorted = new ArrayList<>(state.sites);
+    private static Set<String> readSites(Context context) {
+        ensureMigrated(context);
+        Set<String> sites = new HashSet<>();
+        File source = file(context, SITES_FILE);
+        if (!source.exists()) return sites;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(source), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String domain = normalizeDomain(line);
+                if (domain != null) sites.add(domain);
+            }
+        } catch (Exception ignored) {}
+        return sites;
+    }
+
+    private static void writeSites(Context context, Collection<String> values) {
+        File target = file(context, SITES_FILE);
+        File tmp = file(context, SITES_FILE + ".tmp");
+        List<String> sorted = new ArrayList<>();
+        if (values != null) {
+            for (String value : values) {
+                String domain = normalizeDomain(value);
+                if (domain != null && !sorted.contains(domain)) sorted.add(domain);
+            }
+        }
         Collections.sort(sorted);
 
         try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
                 new FileOutputStream(tmp, false), StandardCharsets.UTF_8))) {
-            writer.write(state.protectionEnabled ? "protection=1" : "protection=0");
-            writer.newLine();
             for (String domain : sorted) {
                 writer.write(domain);
                 writer.newLine();
@@ -111,16 +144,28 @@ public final class BlocklistStore {
         }
     }
 
-    private static void mirrorPrefs(Context context, State state) {
+    private static void setFlag(File marker, boolean enabled) {
+        if (enabled) {
+            if (!marker.exists()) {
+                try { marker.createNewFile(); } catch (Exception ignored) {}
+            }
+        } else if (marker.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            marker.delete();
+        }
+    }
+
+    private static void mirrorPrefs(Context context, Collection<String> sites, boolean protection, boolean active) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit()
-                .putStringSet(KEY_SITES, new HashSet<>(state.sites))
-                .putBoolean(KEY_PROTECTION_ENABLED, state.protectionEnabled)
+                .putStringSet(KEY_SITES, new HashSet<>(sites))
+                .putBoolean(KEY_PROTECTION_ENABLED, protection)
+                .putBoolean(KEY_ACTIVE, active)
                 .commit();
     }
 
     public static synchronized List<String> getSites(Context context) {
-        List<String> out = new ArrayList<>(readState(context).sites);
+        List<String> out = new ArrayList<>(readSites(context));
         Collections.sort(out);
         return out;
     }
@@ -128,38 +173,35 @@ public final class BlocklistStore {
     public static synchronized boolean addSite(Context context, String input) {
         String domain = normalizeDomain(input);
         if (domain == null) return false;
-        State state = readState(context);
-        boolean changed = state.sites.add(domain);
-        if (changed) {
-            writeStateFile(context, state);
-            mirrorPrefs(context, state);
-        }
+        Set<String> sites = readSites(context);
+        sites.add(domain);
+        writeSites(context, sites);
+        mirrorPrefs(context, sites, isProtectionEnabled(context), isVpnActive(context));
         return true;
     }
 
     public static synchronized boolean removeSite(Context context, String input) {
         String domain = normalizeDomain(input);
         if (domain == null) return false;
-        State state = readState(context);
-        boolean changed = state.sites.remove(domain);
+        Set<String> sites = readSites(context);
+        boolean changed = sites.remove(domain);
         if (changed) {
-            writeStateFile(context, state);
-            mirrorPrefs(context, state);
+            writeSites(context, sites);
+            mirrorPrefs(context, sites, isProtectionEnabled(context), isVpnActive(context));
         }
         return changed;
     }
 
     public static synchronized void replaceSites(Context context, Collection<String> inputs) {
-        State state = readState(context);
-        state.sites.clear();
+        Set<String> sites = new HashSet<>();
         if (inputs != null) {
             for (String input : inputs) {
                 String domain = normalizeDomain(input);
-                if (domain != null) state.sites.add(domain);
+                if (domain != null) sites.add(domain);
             }
         }
-        writeStateFile(context, state);
-        mirrorPrefs(context, state);
+        writeSites(context, sites);
+        mirrorPrefs(context, sites, isProtectionEnabled(context), isVpnActive(context));
     }
 
     public static boolean isBlocked(Context context, String host) {
@@ -172,23 +214,31 @@ public final class BlocklistStore {
     }
 
     public static boolean isVpnActive(Context context) {
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ACTIVE, false);
+        ensureMigrated(context);
+        return file(context, ACTIVE_FILE).exists();
     }
 
-    public static void setVpnActive(Context context, boolean active) {
+    public static synchronized void setVpnActive(Context context, boolean active) {
+        ensureMigrated(context);
+        setFlag(file(context, ACTIVE_FILE), active);
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_ACTIVE, active).apply();
+                .edit().putBoolean(KEY_ACTIVE, active).commit();
     }
 
-    public static synchronized boolean isProtectionEnabled(Context context) {
-        return readState(context).protectionEnabled;
+    public static boolean isProtectionEnabled(Context context) {
+        ensureMigrated(context);
+        return file(context, PROTECTION_FILE).exists();
     }
 
     public static synchronized void setProtectionEnabled(Context context, boolean enabled) {
-        State state = readState(context);
-        state.protectionEnabled = enabled;
-        writeStateFile(context, state);
-        mirrorPrefs(context, state);
+        ensureMigrated(context);
+        setFlag(file(context, PROTECTION_FILE), enabled);
+        if (!enabled) setFlag(file(context, ACTIVE_FILE), false);
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_PROTECTION_ENABLED, enabled)
+                .putBoolean(KEY_ACTIVE, enabled && isVpnActive(context))
+                .commit();
     }
 
     public static String normalizeDomain(String input) {

@@ -12,44 +12,84 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * VPN local do Ritmo.
+ *
+ * Ela funciona em split-tunnel: somente o DNS interno do Ritmo e os IPs
+ * associados aos domínios bloqueados entram no túnel. O restante da Internet
+ * continua saindo normalmente pelo Android, sem ser enviado a nenhum servidor
+ * do Ritmo.
+ *
+ * O bloqueio tem duas camadas:
+ * 1) DNS: consultas para domínios bloqueados recebem NXDOMAIN.
+ * 2) IP: o serviço resolve os domínios bloqueados por conta própria e cria
+ *    rotas /32 e /128 para os IPs encontrados. Pacotes para esses IPs são
+ *    capturados e descartados, o que também ajuda quando o navegador usa cache
+ *    ou DNS Seguro/DoH.
+ */
 public class DnsBlockVpnService extends VpnService {
     public static final String ACTION_START = "com.kaua.ritmo.START_BLOCKER";
     public static final String ACTION_STOP = "com.kaua.ritmo.STOP_BLOCKER";
+    public static final String ACTION_REBUILD = "com.kaua.ritmo.REBUILD_BLOCKER";
 
     private static final String VPN_IPV4 = "10.111.222.1";
     private static final String DNS_IPV4 = "10.111.222.2";
     private static final String VPN_IPV6 = "fd66:7269:746d:6f::1";
     private static final String DNS_IPV6 = "fd66:7269:746d:6f::2";
+
     private static final String CHANNEL_ID = "ritmo_blocker";
     private static final int NOTIFICATION_ID = 41;
+    private static final long ROUTE_REFRESH_MS = 5L * 60L * 1000L;
+    private static final int MAX_BLOCKED_ROUTES = 384;
 
-    private static volatile boolean processRunning = false;
-
-    private volatile boolean running;
-    private volatile boolean intentionalStop;
-    private volatile boolean restarting;
-    private ParcelFileDescriptor tun;
-    private Thread worker;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final AtomicInteger generation = new AtomicInteger(0);
+    private final SecureRandom random = new SecureRandom();
+    private final Map<String, Long> recentDynamicResolve = new ConcurrentHashMap<>();
+
+    private volatile boolean intentionalStop;
+    private volatile boolean rebuilding;
+    private volatile ParcelFileDescriptor tun;
+    private volatile Thread worker;
+    private volatile Thread resolverWorker;
     private volatile long lastOverlayAt;
     private volatile String lastOverlayDomain = "";
 
-    public static boolean isRunningNow() {
-        return processRunning;
-    }
+    private volatile Map<String, String> ipToDomain = new LinkedHashMap<>();
+
+    private final Runnable periodicRefresh = new Runnable() {
+        @Override
+        public void run() {
+            if (!intentionalStop && BlocklistStore.isProtectionEnabled(DnsBlockVpnService.this)) {
+                rebuildVpnAsync();
+                mainHandler.postDelayed(this, ROUTE_REFRESH_MS);
+            }
+        }
+    };
 
     @Override
     public void onCreate() {
         super.onCreate();
-        processRunning = false;
         BlocklistStore.setVpnActive(this, false);
     }
 
@@ -60,12 +100,12 @@ public class DnsBlockVpnService extends VpnService {
         if (ACTION_STOP.equals(action)) {
             intentionalStop = true;
             BlocklistStore.setProtectionEnabled(this, false);
+            mainHandler.removeCallbacks(periodicRefresh);
             stopVpnInternal();
             stopSelf();
             return START_NOT_STICKY;
         }
 
-        // START_STICKY can recreate the service with a null Intent.
         if (intent == null && !BlocklistStore.isProtectionEnabled(this)) {
             stopSelf();
             return START_NOT_STICKY;
@@ -74,7 +114,12 @@ public class DnsBlockVpnService extends VpnService {
         intentionalStop = false;
         BlocklistStore.setProtectionEnabled(this, true);
         startInForeground();
-        if (!running) startVpn();
+
+        if (ACTION_REBUILD.equals(action)) rebuildVpnAsync();
+        else if (tun == null) rebuildVpnAsync();
+
+        mainHandler.removeCallbacks(periodicRefresh);
+        mainHandler.postDelayed(periodicRefresh, ROUTE_REFRESH_MS);
         return START_STICKY;
     }
 
@@ -86,13 +131,15 @@ public class DnsBlockVpnService extends VpnService {
                     "Bloqueio de sites",
                     NotificationManager.IMPORTANCE_LOW
             );
-            channel.setDescription("Mantém o filtro local do Ritmo ativo.");
+            channel.setDescription("Mantém a VPN local de bloqueio do Ritmo ativa.");
             nm.createNotificationChannel(channel);
         }
 
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent pi = PendingIntent.getActivity(
-                this, 0, open,
+                this,
+                0,
+                open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
 
@@ -102,7 +149,7 @@ public class DnsBlockVpnService extends VpnService {
 
         Notification notification = builder
                 .setContentTitle("Ritmo protegendo sua navegação")
-                .setContentText("Proteção ativa • DNS IPv4 e IPv6")
+                .setContentText("VPN local ativa • DNS + bloqueio por IP")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -111,53 +158,96 @@ public class DnsBlockVpnService extends VpnService {
         startForeground(NOTIFICATION_ID, notification);
     }
 
-    private synchronized void startVpn() {
-        if (running || intentionalStop) return;
+    private synchronized void rebuildVpnAsync() {
+        if (intentionalStop || rebuilding) return;
+        rebuilding = true;
 
+        resolverWorker = new Thread(() -> {
+            try {
+                Map<String, String> routes = resolveBlockedRoutes();
+                if (!intentionalStop) establishVpn(routes);
+            } finally {
+                rebuilding = false;
+            }
+        }, "RitmoRouteResolver");
+        resolverWorker.start();
+    }
+
+    private void establishVpn(Map<String, String> resolvedRoutes) {
+        ParcelFileDescriptor newTun = null;
         try {
             Builder builder = new Builder()
                     .setSession("Ritmo - Bloqueio de sites")
                     .setMtu(1500)
                     .addAddress(VPN_IPV4, 32)
                     .addDnsServer(DNS_IPV4)
-                    .addRoute(DNS_IPV4, 32);
+                    .addRoute(DNS_IPV4, 32)
+                    .setBlocking(true);
 
-            // IPv6 is an extra protection layer. If a specific device rejects the
-            // synthetic IPv6 interface, IPv4 protection still starts normally.
+            boolean ipv6Enabled = false;
             try {
                 builder.addAddress(VPN_IPV6, 128)
                         .addDnsServer(DNS_IPV6)
                         .addRoute(DNS_IPV6, 128);
+                ipv6Enabled = true;
             } catch (Exception ignored) {}
 
-            tun = builder.establish();
-            if (tun == null) {
-                markStopped();
-                stopSelf();
-                return;
+            int added = 0;
+            LinkedHashMap<String, String> acceptedRoutes = new LinkedHashMap<>();
+            for (Map.Entry<String, String> entry : resolvedRoutes.entrySet()) {
+                if (added >= MAX_BLOCKED_ROUTES) break;
+                String ip = entry.getKey();
+                try {
+                    InetAddress address = InetAddress.getByName(ip);
+                    boolean v6 = address.getAddress().length == 16;
+                    if (v6 && !ipv6Enabled) continue;
+                    builder.addRoute(ip, v6 ? 128 : 32);
+                    acceptedRoutes.put(address.getHostAddress(), entry.getValue());
+                    added++;
+                } catch (Exception ignored) {}
             }
 
-            running = true;
-            processRunning = true;
-            restarting = false;
+            newTun = builder.establish();
+            if (newTun == null) throw new IOException("VPN não pôde ser estabelecida");
+
+            final ParcelFileDescriptor workerTun = newTun;
+            int gen = generation.incrementAndGet();
+            ParcelFileDescriptor oldTun = tun;
+            tun = workerTun;
+            ipToDomain = acceptedRoutes;
             BlocklistStore.setVpnActive(this, true);
-            worker = new Thread(this::runLoop, "RitmoDnsFilter");
-            worker.start();
+
+            Thread newWorker = new Thread(
+                    () -> runLoop(workerTun, gen),
+                    "RitmoVpnFilter-" + gen
+            );
+            worker = newWorker;
+            newWorker.start();
+
+            if (oldTun != null) {
+                try { oldTun.close(); } catch (Exception ignored) {}
+            }
         } catch (Exception e) {
-            markStopped();
-            scheduleRecovery();
+            if (newTun != null) {
+                try { newTun.close(); } catch (Exception ignored) {}
+            }
+            if (tun == null) {
+                BlocklistStore.setVpnActive(this, false);
+                scheduleRecovery();
+            }
         }
     }
 
-    private void runLoop() {
-        try (FileInputStream in = new FileInputStream(tun.getFileDescriptor());
-             FileOutputStream out = new FileOutputStream(tun.getFileDescriptor())) {
+    private void runLoop(ParcelFileDescriptor localTun, int gen) {
+        try (FileInputStream in = new FileInputStream(localTun.getFileDescriptor());
+             FileOutputStream out = new FileOutputStream(localTun.getFileDescriptor())) {
 
             byte[] packet = new byte[32767];
-            while (running && !Thread.currentThread().isInterrupted()) {
+            while (!intentionalStop && gen == generation.get()) {
                 int len = in.read(packet);
                 if (len <= 0) continue;
-                byte[] response = processPacket(Arrays.copyOf(packet, len));
+                byte[] copy = Arrays.copyOf(packet, len);
+                byte[] response = processPacket(copy);
                 if (response != null) {
                     out.write(response);
                     out.flush();
@@ -165,9 +255,10 @@ public class DnsBlockVpnService extends VpnService {
             }
         } catch (IOException ignored) {
         } finally {
-            boolean shouldRecover = !intentionalStop && BlocklistStore.isProtectionEnabled(this);
-            markStopped();
-            if (shouldRecover) scheduleRecovery();
+            if (gen == generation.get() && !intentionalStop) {
+                BlocklistStore.setVpnActive(this, false);
+                if (BlocklistStore.isProtectionEnabled(this)) scheduleRecovery();
+            }
         }
     }
 
@@ -175,67 +266,254 @@ public class DnsBlockVpnService extends VpnService {
         try {
             if (ipPacket.length < 1) return null;
             int version = (ipPacket[0] >> 4) & 0x0F;
-            if (version == 4) return processIpv4UdpDns(ipPacket);
-            if (version == 6) return processIpv6UdpDns(ipPacket);
+            if (version == 4) return processIpv4(ipPacket);
+            if (version == 6) return processIpv6(ipPacket);
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private byte[] processIpv4(byte[] packet) throws Exception {
+        if (packet.length < 20) return null;
+        int ihl = (packet[0] & 0x0F) * 4;
+        if (ihl < 20 || packet.length < ihl) return null;
+
+        String dst = InetAddress.getByAddress(Arrays.copyOfRange(packet, 16, 20)).getHostAddress();
+        if (DNS_IPV4.equals(dst)) return processIpv4UdpDns(packet, ihl);
+
+        String domain = ipToDomain.get(dst);
+        if (domain != null) {
+            showBlockedOverlay(domain);
             return null;
+        }
+        return null;
+    }
+
+    private byte[] processIpv6(byte[] packet) throws Exception {
+        if (packet.length < 40) return null;
+        String dst = InetAddress.getByAddress(Arrays.copyOfRange(packet, 24, 40)).getHostAddress();
+        String normalizedDns = InetAddress.getByName(DNS_IPV6).getHostAddress();
+        if (normalizedDns.equals(dst)) return processIpv6UdpDns(packet);
+
+        String domain = ipToDomain.get(dst);
+        if (domain != null) {
+            showBlockedOverlay(domain);
+            return null;
+        }
+        return null;
+    }
+
+    private byte[] processIpv4UdpDns(byte[] packet, int ihl) {
+        if (packet.length < ihl + 8) return null;
+        if ((packet[9] & 0xFF) != 17) return null;
+
+        int srcPort = u16(packet, ihl);
+        int dstPort = u16(packet, ihl + 2);
+        if (dstPort != 53) return null;
+
+        int udpLength = u16(packet, ihl + 4);
+        int dnsOffset = ihl + 8;
+        int dnsLength = Math.min(Math.max(0, udpLength - 8), packet.length - dnsOffset);
+        if (dnsLength < 12) return null;
+
+        byte[] dnsQuery = Arrays.copyOfRange(packet, dnsOffset, dnsOffset + dnsLength);
+        byte[] dnsResponse = resolveDnsQuery(dnsQuery);
+        return buildUdpIpv4Response(packet, srcPort, dnsResponse);
+    }
+
+    private byte[] processIpv6UdpDns(byte[] packet) {
+        if (packet.length < 48) return null;
+        int nextHeader = packet[6] & 0xFF;
+        if (nextHeader != 17) return null;
+
+        int udpOffset = 40;
+        int srcPort = u16(packet, udpOffset);
+        int dstPort = u16(packet, udpOffset + 2);
+        if (dstPort != 53) return null;
+
+        int udpLength = u16(packet, udpOffset + 4);
+        int dnsOffset = udpOffset + 8;
+        int dnsLength = Math.min(Math.max(0, udpLength - 8), packet.length - dnsOffset);
+        if (dnsLength < 12) return null;
+
+        byte[] dnsQuery = Arrays.copyOfRange(packet, dnsOffset, dnsOffset + dnsLength);
+        byte[] dnsResponse = resolveDnsQuery(dnsQuery);
+        return buildUdpIpv6Response(packet, srcPort, dnsResponse);
+    }
+
+    private byte[] resolveDnsQuery(byte[] query) {
+        String domain = readQuestionName(query);
+        if (domain == null) return buildServerFailure(query);
+
+        if (BlocklistStore.isBlocked(this, domain)) {
+            showBlockedOverlay(domain);
+            learnBlockedHostAsync(domain);
+            return buildNxDomain(query);
+        }
+
+        byte[] forwarded = forwardDns(query);
+        return forwarded == null ? buildServerFailure(query) : forwarded;
+    }
+
+    private void learnBlockedHostAsync(String domain) {
+        long now = System.currentTimeMillis();
+        Long previous = recentDynamicResolve.get(domain);
+        if (previous != null && now - previous < 60_000L) return;
+        recentDynamicResolve.put(domain, now);
+
+        new Thread(() -> {
+            Map<String, String> learned = new LinkedHashMap<>();
+            resolveHost(domain, domain, learned);
+            if (!learned.isEmpty()) rebuildVpnAsync();
+        }, "RitmoLearnHost").start();
+    }
+
+    private Map<String, String> resolveBlockedRoutes() {
+        LinkedHashMap<String, String> result = new LinkedHashMap<>();
+        List<String> blocked = BlocklistStore.getSites(this);
+
+        for (String base : blocked) {
+            if (result.size() >= MAX_BLOCKED_ROUTES) break;
+            LinkedHashSet<String> hosts = new LinkedHashSet<>();
+            hosts.add(base);
+            if (!base.startsWith("www.")) hosts.add("www." + base);
+            if (!base.startsWith("m.")) hosts.add("m." + base);
+
+            for (String host : hosts) {
+                resolveHost(host, base, result);
+                if (result.size() >= MAX_BLOCKED_ROUTES) break;
+            }
+        }
+        return result;
+    }
+
+    private void resolveHost(String host, String baseDomain, Map<String, String> out) {
+        for (String resolver : new String[]{"1.1.1.1", "8.8.8.8"}) {
+            if (out.size() >= MAX_BLOCKED_ROUTES) return;
+            for (int qtype : new int[]{1, 28}) {
+                try {
+                    byte[] query = buildDnsLookup(host, qtype);
+                    byte[] response = sendDirectDns(query, resolver);
+                    if (response == null) continue;
+                    for (InetAddress address : parseAddressAnswers(response)) {
+                        if (out.size() >= MAX_BLOCKED_ROUTES) return;
+                        out.put(address.getHostAddress(), baseDomain);
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private byte[] sendDirectDns(byte[] query, String resolver) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            try { protect(socket); } catch (Exception ignored) {}
+            socket.setSoTimeout(1700);
+            DatagramPacket req = new DatagramPacket(
+                    query,
+                    query.length,
+                    InetAddress.getByName(resolver),
+                    53
+            );
+            socket.send(req);
+            byte[] buf = new byte[8192];
+            DatagramPacket resp = new DatagramPacket(buf, buf.length);
+            socket.receive(resp);
+            return Arrays.copyOf(resp.getData(), resp.getLength());
         } catch (Exception e) {
             return null;
         }
     }
 
-    private byte[] processIpv4UdpDns(byte[] ipPacket) {
-        if (ipPacket.length < 28) return null;
-        int ihl = (ipPacket[0] & 0x0F) * 4;
-        if (ihl < 20 || ipPacket.length < ihl + 8) return null;
-        if ((ipPacket[9] & 0xFF) != 17) return null; // UDP
-
-        int srcPort = u16(ipPacket, ihl);
-        int dstPort = u16(ipPacket, ihl + 2);
-        if (dstPort != 53) return null;
-
-        int udpLength = u16(ipPacket, ihl + 4);
-        int dnsOffset = ihl + 8;
-        int dnsLength = Math.min(Math.max(0, udpLength - 8), ipPacket.length - dnsOffset);
-        if (dnsLength < 12) return null;
-
-        byte[] dnsQuery = Arrays.copyOfRange(ipPacket, dnsOffset, dnsOffset + dnsLength);
-        byte[] dnsResponse = resolveDnsQuery(dnsQuery);
-        return buildUdpIpv4Response(ipPacket, srcPort, dnsResponse);
-    }
-
-    private byte[] processIpv6UdpDns(byte[] ipPacket) {
-        // IPv6 base header is 40 bytes. Android DNS packets to our synthetic resolver
-        // normally arrive without extension headers; unsupported extension headers are ignored.
-        if (ipPacket.length < 48) return null;
-        int nextHeader = ipPacket[6] & 0xFF;
-        if (nextHeader != 17) return null; // UDP
-
-        int udpOffset = 40;
-        int srcPort = u16(ipPacket, udpOffset);
-        int dstPort = u16(ipPacket, udpOffset + 2);
-        if (dstPort != 53) return null;
-
-        int udpLength = u16(ipPacket, udpOffset + 4);
-        int dnsOffset = udpOffset + 8;
-        int dnsLength = Math.min(Math.max(0, udpLength - 8), ipPacket.length - dnsOffset);
-        if (dnsLength < 12) return null;
-
-        byte[] dnsQuery = Arrays.copyOfRange(ipPacket, dnsOffset, dnsOffset + dnsLength);
-        byte[] dnsResponse = resolveDnsQuery(dnsQuery);
-        return buildUdpIpv6Response(ipPacket, srcPort, dnsResponse);
-    }
-
-    private byte[] resolveDnsQuery(byte[] dnsQuery) {
-        String domain = readQuestionName(dnsQuery);
-        if (domain == null) return buildServerFailure(dnsQuery);
-
-        if (BlocklistStore.isBlocked(this, domain)) {
-            showBlockedOverlay(domain);
-            return buildNxDomain(dnsQuery);
+    private byte[] forwardDns(byte[] query) {
+        for (String resolver : new String[]{"1.1.1.1", "8.8.8.8"}) {
+            byte[] response = sendDirectDns(query, resolver);
+            if (response != null) return response;
         }
+        return null;
+    }
 
-        byte[] forwarded = forwardDns(dnsQuery);
-        return forwarded == null ? buildServerFailure(dnsQuery) : forwarded;
+    private byte[] buildDnsLookup(String host, int qtype) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int id = random.nextInt(0x10000);
+        out.write((id >> 8) & 0xFF);
+        out.write(id & 0xFF);
+        out.write(0x01); out.write(0x00); // recursion desired
+        out.write(0x00); out.write(0x01); // QDCOUNT
+        out.write(0x00); out.write(0x00);
+        out.write(0x00); out.write(0x00);
+        out.write(0x00); out.write(0x00);
+
+        for (String label : host.split("\\.")) {
+            byte[] bytes = label.getBytes(StandardCharsets.US_ASCII);
+            if (bytes.length == 0 || bytes.length > 63) throw new IOException("Domínio inválido");
+            out.write(bytes.length);
+            out.write(bytes);
+        }
+        out.write(0);
+        out.write((qtype >> 8) & 0xFF);
+        out.write(qtype & 0xFF);
+        out.write(0); out.write(1); // IN
+        return out.toByteArray();
+    }
+
+    private List<InetAddress> parseAddressAnswers(byte[] msg) {
+        ArrayList<InetAddress> out = new ArrayList<>();
+        try {
+            if (msg.length < 12) return out;
+            int qd = u16(msg, 4);
+            int an = u16(msg, 6);
+            int pos = 12;
+            for (int i = 0; i < qd; i++) {
+                pos = skipDnsName(msg, pos);
+                pos += 4;
+                if (pos > msg.length) return out;
+            }
+            for (int i = 0; i < an && pos < msg.length; i++) {
+                pos = skipDnsName(msg, pos);
+                if (pos + 10 > msg.length) break;
+                int type = u16(msg, pos); pos += 2;
+                int clazz = u16(msg, pos); pos += 2;
+                pos += 4; // TTL
+                int rdLen = u16(msg, pos); pos += 2;
+                if (pos + rdLen > msg.length) break;
+                if (clazz == 1 && type == 1 && rdLen == 4) {
+                    out.add(InetAddress.getByAddress(Arrays.copyOfRange(msg, pos, pos + 4)));
+                } else if (clazz == 1 && type == 28 && rdLen == 16) {
+                    out.add(InetAddress.getByAddress(Arrays.copyOfRange(msg, pos, pos + 16)));
+                }
+                pos += rdLen;
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    private int skipDnsName(byte[] msg, int pos) {
+        while (pos < msg.length) {
+            int len = msg[pos] & 0xFF;
+            if (len == 0) return pos + 1;
+            if ((len & 0xC0) == 0xC0) return Math.min(msg.length, pos + 2);
+            pos += 1 + len;
+        }
+        return msg.length;
+    }
+
+    private String readQuestionName(byte[] dns) {
+        try {
+            if (dns.length < 13 || u16(dns, 4) < 1) return null;
+            int pos = 12;
+            StringBuilder host = new StringBuilder();
+            while (pos < dns.length) {
+                int len = dns[pos++] & 0xFF;
+                if (len == 0) break;
+                if ((len & 0xC0) != 0 || len > 63 || pos + len > dns.length) return null;
+                if (host.length() > 0) host.append('.');
+                host.append(new String(dns, pos, len, StandardCharsets.US_ASCII));
+                pos += len;
+            }
+            String value = host.toString().toLowerCase(Locale.ROOT);
+            return value.isEmpty() ? null : value;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void showBlockedOverlay(String domain) {
@@ -243,7 +521,7 @@ public class DnsBlockVpnService extends VpnService {
 
         long now = System.currentTimeMillis();
         if (domain.equals(lastOverlayDomain) && now - lastOverlayAt < 8000) return;
-        if (now - lastOverlayAt < 2500) return;
+        if (now - lastOverlayAt < 2000) return;
 
         lastOverlayAt = now;
         lastOverlayDomain = domain;
@@ -251,49 +529,19 @@ public class DnsBlockVpnService extends VpnService {
         try {
             Intent overlay = new Intent(this, BlockedOverlayService.class);
             overlay.putExtra(BlockedOverlayService.EXTRA_DOMAIN, domain);
-            startService(overlay);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundServiceCompat(overlay);
+            else startService(overlay);
         } catch (Exception ignored) {
+            try { startService(new Intent(this, BlockedOverlayService.class)
+                    .putExtra(BlockedOverlayService.EXTRA_DOMAIN, domain)); } catch (Exception ignored2) {}
         }
     }
 
-    private byte[] forwardDns(byte[] query) {
-        String[] resolvers = {"1.1.1.1", "8.8.8.8"};
-        for (String resolver : resolvers) {
-            try (DatagramSocket socket = new DatagramSocket()) {
-                if (!protect(socket)) continue;
-                socket.setSoTimeout(1800);
-                byte[] rx = new byte[8192];
-                DatagramPacket request = new DatagramPacket(
-                        query, query.length, InetAddress.getByName(resolver), 53
-                );
-                socket.send(request);
-                DatagramPacket response = new DatagramPacket(rx, rx.length);
-                socket.receive(response);
-                return Arrays.copyOf(response.getData(), response.getLength());
-            } catch (Exception ignored) {
-            }
-        }
-        return null;
-    }
-
-    private String readQuestionName(byte[] dns) {
-        if (dns.length < 13) return null;
-        int qd = u16(dns, 4);
-        if (qd < 1) return null;
-        int p = 12;
-        StringBuilder host = new StringBuilder();
-        int labels = 0;
-        while (p < dns.length && labels++ < 128) {
-            int n = dns[p++] & 0xFF;
-            if (n == 0) break;
-            if ((n & 0xC0) != 0 || n > 63 || p + n > dns.length) return null;
-            if (host.length() > 0) host.append('.');
-            for (int i = 0; i < n; i++) {
-                int c = dns[p++] & 0xFF;
-                host.append((char) c);
-            }
-        }
-        return host.length() == 0 ? null : host.toString().toLowerCase();
+    private void startForegroundServiceCompat(Intent intent) {
+        // BlockedOverlayService normalmente abre enquanto existe atividade visível
+        // (navegador). startService é permitido nesse cenário. Mantemos este método
+        // separado para centralizar o fallback em ROMs mais agressivas.
+        startService(intent);
     }
 
     private byte[] buildNxDomain(byte[] query) {
@@ -322,25 +570,19 @@ public class DnsBlockVpnService extends VpnService {
         int ihl = 20;
         int totalLength = ihl + 8 + dnsPayload.length;
         byte[] out = new byte[totalLength];
-
         out[0] = 0x45;
-        out[1] = 0;
         put16(out, 2, totalLength);
-        put16(out, 4, 0);
         put16(out, 6, 0x4000);
         out[8] = 64;
         out[9] = 17;
-
-        // Source = original destination, destination = original source.
         System.arraycopy(request, 16, out, 12, 4);
         System.arraycopy(request, 12, out, 16, 4);
         put16(out, 10, 0);
         put16(out, 10, ipv4Checksum(out, 0, ihl));
-
         put16(out, ihl, 53);
         put16(out, ihl + 2, clientPort);
         put16(out, ihl + 4, 8 + dnsPayload.length);
-        put16(out, ihl + 6, 0); // UDP checksum is optional for IPv4.
+        put16(out, ihl + 6, 0);
         System.arraycopy(dnsPayload, 0, out, ihl + 8, dnsPayload.length);
         return out;
     }
@@ -348,23 +590,18 @@ public class DnsBlockVpnService extends VpnService {
     private byte[] buildUdpIpv6Response(byte[] request, int clientPort, byte[] dnsPayload) {
         int udpLength = 8 + dnsPayload.length;
         byte[] out = new byte[40 + udpLength];
-
         out[0] = 0x60;
         put16(out, 4, udpLength);
-        out[6] = 17; // UDP
+        out[6] = 17;
         out[7] = 64;
-
-        // Swap IPv6 source/destination addresses.
         System.arraycopy(request, 24, out, 8, 16);
         System.arraycopy(request, 8, out, 24, 16);
-
         int udp = 40;
         put16(out, udp, 53);
         put16(out, udp + 2, clientPort);
         put16(out, udp + 4, udpLength);
         put16(out, udp + 6, 0);
         System.arraycopy(dnsPayload, 0, out, udp + 8, dnsPayload.length);
-
         int checksum = udpIpv6Checksum(out, udp, udpLength);
         if (checksum == 0) checksum = 0xFFFF;
         put16(out, udp + 6, checksum);
@@ -373,17 +610,11 @@ public class DnsBlockVpnService extends VpnService {
 
     private int udpIpv6Checksum(byte[] packet, int udpOffset, int udpLength) {
         long sum = 0;
-
-        // IPv6 pseudo-header: src + dst.
         sum = checksumWords(packet, 8, 16, sum);
         sum = checksumWords(packet, 24, 16, sum);
-
-        // UDP length as 32 bits.
         sum += (udpLength >> 16) & 0xFFFF;
         sum += udpLength & 0xFFFF;
-        // Three zero bytes + next-header (17).
         sum += 17;
-
         sum = checksumWords(packet, udpOffset, udpLength, sum);
         while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
         return (int) (~sum) & 0xFFFF;
@@ -391,7 +622,7 @@ public class DnsBlockVpnService extends VpnService {
 
     private long checksumWords(byte[] data, int offset, int length, long initial) {
         long sum = initial;
-        int end = offset + length;
+        int end = Math.min(data.length, offset + length);
         for (int i = offset; i < end; i += 2) {
             int hi = data[i] & 0xFF;
             int lo = (i + 1 < end) ? (data[i + 1] & 0xFF) : 0;
@@ -408,6 +639,7 @@ public class DnsBlockVpnService extends VpnService {
     }
 
     private int u16(byte[] data, int off) {
+        if (off < 0 || off + 1 >= data.length) return 0;
         return ((data[off] & 0xFF) << 8) | (data[off + 1] & 0xFF);
     }
 
@@ -416,41 +648,35 @@ public class DnsBlockVpnService extends VpnService {
         data[off + 1] = (byte) (value & 0xFF);
     }
 
-    private synchronized void markStopped() {
-        running = false;
-        processRunning = false;
-        BlocklistStore.setVpnActive(this, false);
-        if (tun != null) {
-            try { tun.close(); } catch (IOException ignored) {}
-            tun = null;
-        }
-    }
-
     private synchronized void stopVpnInternal() {
-        running = false;
-        processRunning = false;
+        generation.incrementAndGet();
+        ParcelFileDescriptor current = tun;
+        tun = null;
+        if (current != null) {
+            try { current.close(); } catch (Exception ignored) {}
+        }
+        Thread w = worker;
+        worker = null;
+        if (w != null) w.interrupt();
         BlocklistStore.setVpnActive(this, false);
-        if (worker != null) {
-            worker.interrupt();
-            worker = null;
-        }
-        if (tun != null) {
-            try { tun.close(); } catch (IOException ignored) {}
-            tun = null;
-        }
         stopForeground(true);
     }
 
     private void scheduleRecovery() {
-        if (restarting || intentionalStop || !BlocklistStore.isProtectionEnabled(this)) return;
-        restarting = true;
+        if (intentionalStop || !BlocklistStore.isProtectionEnabled(this)) return;
         mainHandler.postDelayed(() -> {
-            restarting = false;
-            if (!intentionalStop && !running && BlocklistStore.isProtectionEnabled(this)) {
-                startInForeground();
-                startVpn();
+            if (!intentionalStop && BlocklistStore.isProtectionEnabled(this) && tun == null) {
+                rebuildVpnAsync();
             }
-        }, 1200);
+        }, 1800L);
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        if (!intentionalStop && BlocklistStore.isProtectionEnabled(this)) {
+            mainHandler.postDelayed(this::rebuildVpnAsync, 800L);
+        }
+        super.onTaskRemoved(rootIntent);
     }
 
     @Override
@@ -464,9 +690,12 @@ public class DnsBlockVpnService extends VpnService {
 
     @Override
     public void onDestroy() {
-        boolean shouldRemainEnabled = !intentionalStop && BlocklistStore.isProtectionEnabled(this);
-        stopVpnInternal();
-        if (!shouldRemainEnabled) BlocklistStore.setProtectionEnabled(this, false);
+        mainHandler.removeCallbacks(periodicRefresh);
+        if (intentionalStop || !BlocklistStore.isProtectionEnabled(this)) {
+            stopVpnInternal();
+        } else {
+            BlocklistStore.setVpnActive(this, false);
+        }
         super.onDestroy();
     }
 }

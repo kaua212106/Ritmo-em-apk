@@ -5,7 +5,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:allowBackup="true"
@@ -26,9 +25,12 @@
 
         <service
             android:name=".DnsBlockVpnService"
+            android:enabled="true"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse"
+            android:process=":vpn"
+            android:stopWithTask="false">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
@@ -37,41 +39,15 @@
                 android:value="true" />
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Local DNS filtering for user-selected website blocking" />
+                android:value="Local split-tunnel DNS and IP filtering for user-selected website blocking" />
         </service>
 
         <service
             android:name=".BlockedOverlayService"
-            android:exported="false" />
-
-        <service
-            android:name=".StrictBlockAccessibilityService"
             android:enabled="true"
             android:exported="false"
-            android:label="Ritmo - Modo rígido"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:stopWithTask="false"
-            android:process=":strict">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
-        </service>
-
-
-        <service
-            android:name=".ProtectionWatchdogService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="specialUse"
-            android:process=":watchdog"
-            android:stopWithTask="false">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps the user-enabled strict website blocking mode monitored in the background" />
-        </service>
+            android:process=":vpn"
+            android:stopWithTask="false" />
 
         <receiver
             android:name=".BootReceiver"

@@ -11,8 +11,8 @@ android {
         applicationId 'com.kaua.ritmo'
         minSdk 26
         targetSdk 35
-        versionCode 7
-        versionName '1.4.2'
+        versionCode 8
+        versionName '1.5.0'
     }
 
     compileOptions {
@@ -47,7 +47,6 @@ tasks.register('prepareFlatProject') {
         def javaDir = file("$buildDir/generated/flatJava/com/kaua/ritmo")
         def assetsDir = file("$buildDir/generated/flatAssets")
         def drawableDir = file("$buildDir/generated/flatRes/drawable")
-        def xmlDir = file("$buildDir/generated/flatRes/xml")
 
         delete file("$buildDir/generated/flatJava")
         delete file("$buildDir/generated/flatAssets")
@@ -56,10 +55,9 @@ tasks.register('prepareFlatProject') {
         javaDir.mkdirs()
         assetsDir.mkdirs()
         drawableDir.mkdirs()
-        xmlDir.mkdirs()
 
         copy {
-            from 'MainActivity.java', 'DnsBlockVpnService.java', 'BlocklistStore.java', 'BlockedOverlayService.java', 'BootReceiver.java', 'StrictBlockAccessibilityService.java', 'ProtectionWatchdogService.java'
+            from 'MainActivity.java', 'DnsBlockVpnService.java', 'BlocklistStore.java', 'BlockedOverlayService.java', 'BootReceiver.java'
             into javaDir
         }
 
@@ -71,11 +69,6 @@ tasks.register('prepareFlatProject') {
         copy {
             from 'icone.png'
             into drawableDir
-        }
-
-        copy {
-            from 'accessibility_service_config.xml'
-            into xmlDir
         }
     }
 }
