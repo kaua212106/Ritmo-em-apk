@@ -1,0 +1,66 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+
+android {
+    namespace 'com.kaua.ritmo'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.kaua.ritmo'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ["$buildDir/generated/flatJava"]
+            assets.srcDirs = ["$buildDir/generated/flatAssets"]
+            res.srcDirs = ["$buildDir/generated/flatRes"]
+        }
+    }
+}
+
+tasks.register('prepareFlatProject') {
+    doLast {
+        def javaDir = file("$buildDir/generated/flatJava/com/kaua/ritmo")
+        def assetsDir = file("$buildDir/generated/flatAssets")
+        def drawableDir = file("$buildDir/generated/flatRes/drawable")
+
+        delete file("$buildDir/generated/flatJava")
+        delete file("$buildDir/generated/flatAssets")
+        delete file("$buildDir/generated/flatRes")
+
+        javaDir.mkdirs()
+        assetsDir.mkdirs()
+        drawableDir.mkdirs()
+
+        copy {
+            from 'MainActivity.java', 'DnsBlockVpnService.java', 'BlocklistStore.java'
+            into javaDir
+        }
+
+        copy {
+            from 'index.html', 'manifest.json', 'service-worker.js', 'icone.png'
+            into assetsDir
+        }
+
+        copy {
+            from 'icone.png'
+            into drawableDir
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('prepareFlatProject')
+}
