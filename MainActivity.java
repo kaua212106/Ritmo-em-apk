@@ -2,6 +2,7 @@ package com.kaua.ritmo;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
@@ -202,6 +203,46 @@ public class MainActivity extends Activity {
         Intent prepare = VpnService.prepare(this);
         if (prepare != null) startActivityForResult(prepare, VPN_REQUEST);
         else startVpnService();
+    }
+
+    private boolean isStrictAccessibilityEnabledInternal() {
+        try {
+            int enabled = Settings.Secure.getInt(
+                    getContentResolver(),
+                    Settings.Secure.ACCESSIBILITY_ENABLED,
+                    0
+            );
+            if (enabled != 1) return false;
+
+            String services = Settings.Secure.getString(
+                    getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            );
+            if (services == null || services.isEmpty()) return false;
+
+            String expected = new ComponentName(
+                    this,
+                    StrictBlockAccessibilityService.class
+            ).flattenToString();
+
+            for (String service : services.split(":")) {
+                if (expected.equalsIgnoreCase(service)) return true;
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private void openAccessibilitySettingsInternal() {
+        try {
+            Toast.makeText(
+                    this,
+                    "Ative o serviço Ritmo - Modo rígido. Ele verifica a barra de endereço do navegador para reforçar o bloqueio.",
+                    Toast.LENGTH_LONG
+            ).show();
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+        } catch (Exception e) {
+            startActivity(new Intent(Settings.ACTION_SETTINGS));
+        }
     }
 
     private void refreshWebSoon() {
@@ -490,6 +531,16 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void stopVpn() {
             runOnUiThread(MainActivity.this::stopVpnService);
+        }
+
+        @JavascriptInterface
+        public boolean isStrictModeEnabled() {
+            return isStrictAccessibilityEnabledInternal();
+        }
+
+        @JavascriptInterface
+        public void openAccessibilitySettings() {
+            runOnUiThread(MainActivity.this::openAccessibilitySettingsInternal);
         }
 
         @JavascriptInterface
