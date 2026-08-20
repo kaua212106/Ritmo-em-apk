@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.provider.Settings;
 import android.system.OsConstants;
 
 import java.io.FileInputStream;
@@ -31,6 +32,8 @@ public class DnsBlockVpnService extends VpnService {
     private volatile boolean running;
     private ParcelFileDescriptor tun;
     private Thread worker;
+    private volatile long lastOverlayAt;
+    private volatile String lastOverlayDomain = "";
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -152,6 +155,7 @@ public class DnsBlockVpnService extends VpnService {
 
             byte[] dnsResponse;
             if (BlocklistStore.isBlocked(this, domain)) {
+                showBlockedOverlay(domain);
                 dnsResponse = buildNxDomain(dnsQuery);
             } else {
                 dnsResponse = forwardDns(dnsQuery);
@@ -161,6 +165,24 @@ public class DnsBlockVpnService extends VpnService {
             return buildUdpIpv4Response(ipPacket, ihl, srcPort, dnsResponse);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    private void showBlockedOverlay(String domain) {
+        if (!Settings.canDrawOverlays(this)) return;
+
+        long now = System.currentTimeMillis();
+        if (domain.equals(lastOverlayDomain) && now - lastOverlayAt < 8000) return;
+        if (now - lastOverlayAt < 2500) return;
+
+        lastOverlayAt = now;
+        lastOverlayDomain = domain;
+
+        try {
+            Intent overlay = new Intent(this, BlockedOverlayService.class);
+            overlay.putExtra(BlockedOverlayService.EXTRA_DOMAIN, domain);
+            startService(overlay);
+        } catch (Exception ignored) {
         }
     }
 

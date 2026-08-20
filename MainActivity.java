@@ -15,12 +15,14 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Toast;
 
 import org.json.JSONArray;
 
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 7001;
     private static final int FILE_REQUEST = 7002;
+    private static final int OVERLAY_REQUEST = 7003;
 
     private WebView webView;
     private ValueCallback<Uri[]> fileCallback;
@@ -84,6 +86,27 @@ public class MainActivity extends Activity {
         refreshWebSoon();
     }
 
+    private void requestOverlayThenVpn() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            try {
+                Intent overlay = new Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName())
+                );
+                startActivityForResult(overlay, OVERLAY_REQUEST);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        requestVpnPermissionNow();
+    }
+
+    private void requestVpnPermissionNow() {
+        Intent prepare = VpnService.prepare(this);
+        if (prepare != null) startActivityForResult(prepare, VPN_REQUEST);
+        else startVpnService();
+    }
+
     private void refreshWebSoon() {
         webView.postDelayed(() -> webView.evaluateJavascript("window.refreshNativeBlocker && refreshNativeBlocker();", null), 450);
     }
@@ -97,11 +120,25 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == OVERLAY_REQUEST) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                Toast.makeText(
+                        this,
+                        "Sem a permissão sobre outros apps, o bloqueio funciona, mas a tela motivacional não aparece.",
+                        Toast.LENGTH_LONG
+                ).show();
+            }
+            requestVpnPermissionNow();
+            return;
+        }
+
         if (requestCode == VPN_REQUEST) {
             if (resultCode == RESULT_OK) startVpnService();
             else refreshWebSoon();
             return;
         }
+
         if (requestCode == FILE_REQUEST) {
             if (fileCallback == null) return;
             Uri[] result = null;
@@ -156,11 +193,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void requestVpnPermission() {
-            runOnUiThread(() -> {
-                Intent prepare = VpnService.prepare(MainActivity.this);
-                if (prepare != null) startActivityForResult(prepare, VPN_REQUEST);
-                else startVpnService();
-            });
+            runOnUiThread(MainActivity.this::requestOverlayThenVpn);
         }
 
         @JavascriptInterface
