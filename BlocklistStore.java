@@ -6,6 +6,7 @@ import android.content.SharedPreferences;
 import java.net.IDN;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -32,9 +33,9 @@ public final class BlocklistStore {
         if (domain == null) return false;
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         Set<String> set = new HashSet<>(sp.getStringSet(KEY_SITES, Collections.emptySet()));
-        boolean changed = set.add(domain);
+        set.add(domain);
         sp.edit().putStringSet(KEY_SITES, set).apply();
-        return changed;
+        return true;
     }
 
     public static synchronized boolean removeSite(Context context, String input) {
@@ -45,6 +46,20 @@ public final class BlocklistStore {
         boolean changed = set.remove(domain);
         sp.edit().putStringSet(KEY_SITES, set).apply();
         return changed;
+    }
+
+    public static synchronized void replaceSites(Context context, Collection<String> inputs) {
+        Set<String> set = new HashSet<>();
+        if (inputs != null) {
+            for (String input : inputs) {
+                String domain = normalizeDomain(input);
+                if (domain != null) set.add(domain);
+            }
+        }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putStringSet(KEY_SITES, set)
+                .apply();
     }
 
     public static boolean isBlocked(Context context, String host) {
