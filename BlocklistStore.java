@@ -17,6 +17,7 @@ public final class BlocklistStore {
     private static final String PREFS = "ritmo_blocker";
     private static final String KEY_SITES = "blocked_sites";
     private static final String KEY_ACTIVE = "vpn_active";
+    private static final String KEY_PROTECTION_ENABLED = "protection_enabled";
 
     private BlocklistStore() {}
 
@@ -76,7 +77,22 @@ public final class BlocklistStore {
     }
 
     public static void setVpnActive(Context context, boolean active) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ACTIVE, active).apply();
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ACTIVE, active)
+                .apply();
+    }
+
+    public static boolean isProtectionEnabled(Context context) {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_PROTECTION_ENABLED, false);
+    }
+
+    public static void setProtectionEnabled(Context context, boolean enabled) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_PROTECTION_ENABLED, enabled)
+                .apply();
     }
 
     public static String normalizeDomain(String input) {

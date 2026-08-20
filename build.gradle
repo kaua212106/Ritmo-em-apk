@@ -11,8 +11,8 @@ android {
         applicationId 'com.kaua.ritmo'
         minSdk 26
         targetSdk 35
-        versionCode 3
-        versionName '1.2.0'
+        versionCode 4
+        versionName '1.3.0'
     }
 
     compileOptions {
@@ -57,7 +57,7 @@ tasks.register('prepareFlatProject') {
         drawableDir.mkdirs()
 
         copy {
-            from 'MainActivity.java', 'DnsBlockVpnService.java', 'BlocklistStore.java', 'BlockedOverlayService.java'
+            from 'MainActivity.java', 'DnsBlockVpnService.java', 'BlocklistStore.java', 'BlockedOverlayService.java', 'BootReceiver.java'
             into javaDir
         }
 

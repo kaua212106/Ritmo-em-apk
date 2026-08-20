@@ -161,6 +161,7 @@ public class MainActivity extends Activity {
     }
 
     private void startVpnService() {
+        BlocklistStore.setProtectionEnabled(this, true);
         Intent intent = new Intent(this, DnsBlockVpnService.class).setAction(DnsBlockVpnService.ACTION_START);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
         else startService(intent);
@@ -168,9 +169,19 @@ public class MainActivity extends Activity {
     }
 
     private void stopVpnService() {
+        BlocklistStore.setProtectionEnabled(this, false);
         Intent intent = new Intent(this, DnsBlockVpnService.class).setAction(DnsBlockVpnService.ACTION_STOP);
         startService(intent);
         refreshWebSoon();
+    }
+
+    private void ensureBlockerRunningIfNeeded() {
+        if (!BlocklistStore.isProtectionEnabled(this)) return;
+        if (DnsBlockVpnService.isRunningNow()) return;
+        if (VpnService.prepare(this) != null) return;
+        try {
+            startVpnService();
+        } catch (Exception ignored) {}
     }
 
     private void requestOverlayThenVpn() {
@@ -267,6 +278,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        ensureBlockerRunningIfNeeded();
         refreshWebSoon();
     }
 
@@ -426,7 +438,14 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
-        public boolean isVpnActive() { return BlocklistStore.isVpnActive(context); }
+        public boolean isVpnActive() {
+            return DnsBlockVpnService.isRunningNow() && BlocklistStore.isVpnActive(context);
+        }
+
+        @JavascriptInterface
+        public boolean isProtectionEnabled() {
+            return BlocklistStore.isProtectionEnabled(context);
+        }
 
         @JavascriptInterface
         public String getBlockedSites() {
