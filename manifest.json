@@ -1,0 +1,19 @@
+{
+  "name": "Ritmo",
+  "short_name": "Ritmo",
+  "description": "Acompanhamento privado de hábitos e metas pessoais.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#08111f",
+  "theme_color": "#0b1220",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "icone.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
