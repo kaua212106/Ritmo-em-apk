@@ -50,7 +50,8 @@
             android:exported="false"
             android:label="Ritmo - Modo rígido"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:stopWithTask="false">
+            android:stopWithTask="false"
+            android:process=":strict">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>

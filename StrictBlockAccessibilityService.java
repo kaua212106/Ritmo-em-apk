@@ -18,44 +18,25 @@ import java.util.Set;
 
 public class StrictBlockAccessibilityService extends AccessibilityService {
     private static final Set<String> KNOWN_BROWSERS = new HashSet<>(Arrays.asList(
-            "com.android.chrome",
-            "com.chrome.beta",
-            "com.chrome.dev",
-            "com.chrome.canary",
-            "com.google.android.apps.chrome",
-            "com.brave.browser",
-            "com.brave.browser_beta",
-            "com.brave.browser_nightly",
-            "com.microsoft.emmx",
-            "org.mozilla.firefox",
-            "org.mozilla.firefox_beta",
-            "org.mozilla.fenix",
-            "com.sec.android.app.sbrowser",
-            "com.sec.android.app.sbrowser.beta",
-            "com.opera.browser",
-            "com.opera.browser.beta",
-            "com.opera.mini.native",
-            "com.vivaldi.browser",
-            "com.vivaldi.browser.snapshot",
-            "com.kiwibrowser.browser",
-            "org.chromium.chrome"
+            "com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary",
+            "com.google.android.apps.chrome", "com.brave.browser", "com.brave.browser_beta",
+            "com.brave.browser_nightly", "com.microsoft.emmx", "org.mozilla.firefox",
+            "org.mozilla.firefox_beta", "org.mozilla.fenix", "com.sec.android.app.sbrowser",
+            "com.sec.android.app.sbrowser.beta", "com.opera.browser", "com.opera.browser.beta",
+            "com.opera.mini.native", "com.vivaldi.browser", "com.vivaldi.browser.snapshot",
+            "com.kiwibrowser.browser", "org.chromium.chrome"
     ));
 
     private static final String[] COMMON_URL_IDS = {
-            "com.android.chrome:id/url_bar",
-            "com.chrome.beta:id/url_bar",
-            "com.chrome.dev:id/url_bar",
-            "com.chrome.canary:id/url_bar",
-            "com.brave.browser:id/url_bar",
-            "com.brave.browser_beta:id/url_bar",
-            "com.microsoft.emmx:id/url_bar",
-            "org.chromium.chrome:id/url_bar",
+            "com.android.chrome:id/url_bar", "com.chrome.beta:id/url_bar",
+            "com.chrome.dev:id/url_bar", "com.chrome.canary:id/url_bar",
+            "com.brave.browser:id/url_bar", "com.brave.browser_beta:id/url_bar",
+            "com.microsoft.emmx:id/url_bar", "org.chromium.chrome:id/url_bar",
             "com.sec.android.app.sbrowser:id/location_bar_edit_text",
             "com.sec.android.app.sbrowser:id/location_bar",
             "org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
             "org.mozilla.firefox:id/mozac_browser_toolbar_edit_url_view",
-            "com.opera.browser:id/url_field",
-            "com.vivaldi.browser:id/url_bar"
+            "com.opera.browser:id/url_field", "com.vivaldi.browser:id/url_bar"
     };
 
     private long lastBlockedAt = 0L;
@@ -64,36 +45,43 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
-
         try {
             AccessibilityServiceInfo info = getServiceInfo();
             if (info != null) {
                 info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
                 info.flags |= AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
                 info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
-                info.notificationTimeout = 80;
+                info.notificationTimeout = 100;
                 setServiceInfo(info);
             }
-        } catch (Exception ignored) {
-        }
-
-        startWatchdog();
+        } catch (Throwable ignored) {}
+        startWatchdogSafely();
     }
 
-    private void startWatchdog() {
+    private void startWatchdogSafely() {
         try {
             Intent guard = new Intent(this, ProtectionWatchdogService.class)
                     .setAction(ProtectionWatchdogService.ACTION_START);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(guard);
             else startService(guard);
-        } catch (Exception ignored) {
-        }
+        } catch (Throwable ignored) {}
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        // Accessibility events can become invalid while the browser is changing screens.
+        // Nothing from one malformed/stale event is allowed to terminate the service.
+        try {
+            handleAccessibilityEvent(event);
+        } catch (Throwable ignored) {
+            // Keep the accessibility service alive. The next browser event will be processed normally.
+        }
+    }
+
+    private void handleAccessibilityEvent(AccessibilityEvent event) {
         if (event == null || !BlocklistStore.isProtectionEnabled(this)) return;
-        if (BlocklistStore.getSites(this).isEmpty()) return;
+        List<String> sites = BlocklistStore.getSites(this);
+        if (sites.isEmpty()) return;
 
         CharSequence packageNameCs = event.getPackageName();
         if (packageNameCs == null) return;
@@ -101,48 +89,54 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
         if (!looksLikeBrowserPackage(packageName)) return;
 
         String blocked = null;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root != null) {
-            blocked = findBlockedFromKnownUrlBars(root);
-            if (blocked == null) blocked = findBlockedFromEditableAddressFields(root);
-        }
-
-        if (blocked == null && event.getSource() != null) {
-            AccessibilityNodeInfo src = event.getSource();
-            if (src.isEditable() || looksLikeUrlField(src.getViewIdResourceName())) {
-                blocked = findBlockedInText(src.getText());
-                if (blocked == null) blocked = findBlockedInText(src.getContentDescription());
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            if (root != null) {
+                blocked = findBlockedFromKnownUrlBars(root, sites);
+                if (blocked == null) blocked = findBlockedFromEditableAddressFields(root, sites);
             }
+        } catch (Throwable ignored) {}
+
+        if (blocked == null) {
+            AccessibilityNodeInfo src = null;
+            try {
+                // Read event.getSource() only once. The source can disappear between binder calls.
+                src = event.getSource();
+                if (src != null && (src.isEditable() || looksLikeUrlField(src.getViewIdResourceName()))) {
+                    blocked = findBlockedInText(src.getText(), sites);
+                    if (blocked == null) blocked = findBlockedInText(src.getContentDescription(), sites);
+                }
+            } catch (Throwable ignored) {}
         }
 
-        if (blocked == null) return;
-        blockNow(blocked);
+        if (blocked != null) blockNow(blocked);
     }
 
     private boolean looksLikeBrowserPackage(String pkg) {
         if (KNOWN_BROWSERS.contains(pkg)) return true;
         String p = pkg.toLowerCase(Locale.ROOT);
-        return p.contains("browser") || p.contains("chrome") || p.contains("firefox") || p.contains("brave") || p.contains("vivaldi") || p.contains("opera");
+        return p.contains("browser") || p.contains("chrome") || p.contains("firefox")
+                || p.contains("brave") || p.contains("vivaldi") || p.contains("opera");
     }
 
-    private String findBlockedFromKnownUrlBars(AccessibilityNodeInfo root) {
+    private String findBlockedFromKnownUrlBars(AccessibilityNodeInfo root, List<String> sites) {
         for (String id : COMMON_URL_IDS) {
             try {
                 List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByViewId(id);
                 if (nodes == null) continue;
                 for (AccessibilityNodeInfo node : nodes) {
                     if (node == null) continue;
-                    String blocked = findBlockedInText(node.getText());
-                    if (blocked == null) blocked = findBlockedInText(node.getContentDescription());
+                    String blocked = findBlockedInText(node.getText(), sites);
+                    if (blocked == null) blocked = findBlockedInText(node.getContentDescription(), sites);
                     if (blocked != null) return blocked;
                 }
-            } catch (Exception ignored) {}
+            } catch (Throwable ignored) {}
         }
         return null;
     }
 
-    private String findBlockedFromEditableAddressFields(AccessibilityNodeInfo root) {
+    private String findBlockedFromEditableAddressFields(AccessibilityNodeInfo root, List<String> sites) {
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
         int visited = 0;
@@ -151,7 +145,6 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
         while (!queue.isEmpty() && visited < 350) {
             AccessibilityNodeInfo node = queue.removeFirst();
             visited++;
-
             try {
                 boolean likelyAddress = node.isEditable() || looksLikeUrlField(node.getViewIdResourceName());
                 if (likelyAddress) {
@@ -159,18 +152,17 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
                     node.getBoundsInScreen(bounds);
                     boolean nearTop = bounds.top < Math.max(500, screenHeight / 3);
                     if (nearTop) {
-                        String blocked = findBlockedInText(node.getText());
-                        if (blocked == null) blocked = findBlockedInText(node.getContentDescription());
+                        String blocked = findBlockedInText(node.getText(), sites);
+                        if (blocked == null) blocked = findBlockedInText(node.getContentDescription(), sites);
                         if (blocked != null) return blocked;
                     }
                 }
-
                 int children = node.getChildCount();
                 for (int i = 0; i < children; i++) {
                     AccessibilityNodeInfo child = node.getChild(i);
                     if (child != null) queue.addLast(child);
                 }
-            } catch (Exception ignored) {}
+            } catch (Throwable ignored) {}
         }
         return null;
     }
@@ -178,15 +170,15 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
     private boolean looksLikeUrlField(String viewId) {
         if (viewId == null) return false;
         String id = viewId.toLowerCase(Locale.ROOT);
-        return id.contains("url_bar") || id.contains("url_field") || id.contains("address") || id.contains("location_bar") || id.contains("toolbar_url");
+        return id.contains("url_bar") || id.contains("url_field") || id.contains("address")
+                || id.contains("location_bar") || id.contains("toolbar_url");
     }
 
-    private String findBlockedInText(CharSequence value) {
+    private String findBlockedInText(CharSequence value, List<String> sites) {
         if (value == null) return null;
         String text = value.toString().trim().toLowerCase(Locale.ROOT);
         if (text.isEmpty()) return null;
-
-        for (String blocked : BlocklistStore.getSites(this)) {
+        for (String blocked : sites) {
             String b = blocked.toLowerCase(Locale.ROOT);
             if (containsDomain(text, b)) return blocked;
         }
@@ -217,45 +209,20 @@ public class StrictBlockAccessibilityService extends AccessibilityService {
         lastBlockedAt = now;
         lastBlockedDomain = domain;
 
-        try {
-            performGlobalAction(GLOBAL_ACTION_BACK);
-        } catch (Exception ignored) {}
+        try { performGlobalAction(GLOBAL_ACTION_BACK); } catch (Throwable ignored) {}
 
         if (Settings.canDrawOverlays(this)) {
             try {
                 Intent overlay = new Intent(this, BlockedOverlayService.class);
                 overlay.putExtra(BlockedOverlayService.EXTRA_DOMAIN, domain);
                 startService(overlay);
-            } catch (Exception ignored) {}
+            } catch (Throwable ignored) {}
         }
     }
 
     @Override
-    public boolean onUnbind(Intent intent) {
-        startWatchdog();
-        return true;
-    }
-
-    @Override
-    public void onRebind(Intent intent) {
-        super.onRebind(intent);
-        startWatchdog();
-    }
-
-    @Override
-    public void onTaskRemoved(Intent rootIntent) {
-        startWatchdog();
-        super.onTaskRemoved(rootIntent);
-    }
-
-    @Override
-    public void onDestroy() {
-        startWatchdog();
-        super.onDestroy();
-    }
-
-    @Override
     public void onInterrupt() {
-        startWatchdog();
+        // Android owns the accessibility-service lifecycle. Do not try to restart/bind
+        // the service from here; doing so can create reconnect loops on some OEM builds.
     }
 }
