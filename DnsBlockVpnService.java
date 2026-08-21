@@ -59,13 +59,27 @@ public class DnsBlockVpnService extends VpnService {
 
     private static final String CHANNEL_ID = "ritmo_blocker";
     private static final int NOTIFICATION_ID = 41;
-    private static final long ROUTE_REFRESH_MS = 5L * 60L * 1000L;
-    private static final int MAX_BLOCKED_ROUTES = 384;
+    private static final long ROUTE_REFRESH_MS = 15L * 60L * 1000L;
+    private static final int MAX_DYNAMIC_ROUTES = 48;
+    private static final int MAX_RECENT_DOMAINS = 12;
+    private static final String RESOLVER_BLOCK_MARKER = "__ritmo_resolver__";
+    private static final String[] PUBLIC_RESOLVER_IPS = new String[]{
+            "1.1.1.1", "1.0.0.1",
+            "8.8.8.8", "8.8.4.4",
+            "9.9.9.9", "149.112.112.112",
+            "94.140.14.14", "94.140.15.15",
+            "2606:4700:4700::1111", "2606:4700:4700::1001",
+            "2001:4860:4860::8888", "2001:4860:4860::8844",
+            "2620:fe::fe", "2620:fe::9"
+    };
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicInteger generation = new AtomicInteger(0);
     private final SecureRandom random = new SecureRandom();
     private final Map<String, Long> recentDynamicResolve = new ConcurrentHashMap<>();
+    private final Object dynamicRouteLock = new Object();
+    private final LinkedHashMap<String, String> dynamicRouteCache = new LinkedHashMap<>();
+    private final LinkedHashSet<String> recentRouteDomains = new LinkedHashSet<>();
 
     private volatile boolean intentionalStop;
     private volatile boolean rebuilding;
@@ -81,7 +95,7 @@ public class DnsBlockVpnService extends VpnService {
         @Override
         public void run() {
             if (!intentionalStop && BlocklistStore.isProtectionEnabled(DnsBlockVpnService.this)) {
-                rebuildVpnAsync();
+                refreshRecentRoutesAsync();
                 mainHandler.postDelayed(this, ROUTE_REFRESH_MS);
             }
         }
@@ -149,7 +163,7 @@ public class DnsBlockVpnService extends VpnService {
 
         Notification notification = builder
                 .setContentTitle("Ritmo protegendo sua navegação")
-                .setContentText("VPN local ativa • DNS + bloqueio por IP")
+                .setContentText("VPN local ativa • DNS + IP dinâmico")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -164,16 +178,21 @@ public class DnsBlockVpnService extends VpnService {
 
         resolverWorker = new Thread(() -> {
             try {
-                Map<String, String> routes = resolveBlockedRoutes();
+                pruneDynamicRoutes();
+                Map<String, String> routes = snapshotDynamicRoutes();
                 if (!intentionalStop) establishVpn(routes);
             } finally {
                 rebuilding = false;
             }
-        }, "RitmoRouteResolver");
+        }, "RitmoVpnRebuild");
         resolverWorker.start();
     }
 
     private void establishVpn(Map<String, String> resolvedRoutes) {
+        establishVpnInternal(resolvedRoutes, true, true);
+    }
+
+    private void establishVpnInternal(Map<String, String> resolvedRoutes, boolean includeResolverBlocks, boolean allowFallback) {
         ParcelFileDescriptor newTun = null;
         try {
             Builder builder = new Builder()
@@ -194,8 +213,21 @@ public class DnsBlockVpnService extends VpnService {
 
             int added = 0;
             LinkedHashMap<String, String> acceptedRoutes = new LinkedHashMap<>();
+
+            if (includeResolverBlocks) {
+                for (String ip : PUBLIC_RESOLVER_IPS) {
+                    try {
+                        InetAddress address = InetAddress.getByName(ip);
+                        boolean v6 = address.getAddress().length == 16;
+                        if (v6 && !ipv6Enabled) continue;
+                        builder.addRoute(address.getHostAddress(), v6 ? 128 : 32);
+                        acceptedRoutes.put(address.getHostAddress(), RESOLVER_BLOCK_MARKER);
+                    } catch (Exception ignored) {}
+                }
+            }
+
             for (Map.Entry<String, String> entry : resolvedRoutes.entrySet()) {
-                if (added >= MAX_BLOCKED_ROUTES) break;
+                if (added >= MAX_DYNAMIC_ROUTES) break;
                 String ip = entry.getKey();
                 try {
                     InetAddress address = InetAddress.getByName(ip);
@@ -230,6 +262,12 @@ public class DnsBlockVpnService extends VpnService {
         } catch (Exception e) {
             if (newTun != null) {
                 try { newTun.close(); } catch (Exception ignored) {}
+            }
+            // Se alguma rota dinâmica ou de DNS seguro causar incompatibilidade na ROM,
+            // cai imediatamente para uma VPN DNS mínima em vez de deixar a VPN sempre ativa quebrada.
+            if (allowFallback && (!resolvedRoutes.isEmpty() || includeResolverBlocks)) {
+                establishVpnInternal(new LinkedHashMap<>(), false, false);
+                return;
             }
             if (tun == null) {
                 BlocklistStore.setVpnActive(this, false);
@@ -282,7 +320,7 @@ public class DnsBlockVpnService extends VpnService {
 
         String domain = ipToDomain.get(dst);
         if (domain != null) {
-            showBlockedOverlay(domain);
+            if (!RESOLVER_BLOCK_MARKER.equals(domain)) showBlockedOverlay(domain);
             return null;
         }
         return null;
@@ -296,7 +334,7 @@ public class DnsBlockVpnService extends VpnService {
 
         String domain = ipToDomain.get(dst);
         if (domain != null) {
-            showBlockedOverlay(domain);
+            if (!RESOLVER_BLOCK_MARKER.equals(domain)) showBlockedOverlay(domain);
             return null;
         }
         return null;
@@ -359,48 +397,110 @@ public class DnsBlockVpnService extends VpnService {
         Long previous = recentDynamicResolve.get(domain);
         if (previous != null && now - previous < 60_000L) return;
         recentDynamicResolve.put(domain, now);
+        rememberRecentDomain(domain);
 
         new Thread(() -> {
-            Map<String, String> learned = new LinkedHashMap<>();
-            resolveHost(domain, domain, learned);
-            if (!learned.isEmpty()) rebuildVpnAsync();
+            LinkedHashMap<String, String> learned = resolveOneBlockedDomain(domain);
+            if (!learned.isEmpty()) {
+                mergeDynamicRoutes(learned);
+                rebuildVpnAsync();
+            }
         }, "RitmoLearnHost").start();
     }
 
-    private Map<String, String> resolveBlockedRoutes() {
+    private LinkedHashMap<String, String> resolveOneBlockedDomain(String base) {
         LinkedHashMap<String, String> result = new LinkedHashMap<>();
-        List<String> blocked = BlocklistStore.getSites(this);
-
-        for (String base : blocked) {
-            if (result.size() >= MAX_BLOCKED_ROUTES) break;
-            LinkedHashSet<String> hosts = new LinkedHashSet<>();
-            hosts.add(base);
-            if (!base.startsWith("www.")) hosts.add("www." + base);
-            if (!base.startsWith("m.")) hosts.add("m." + base);
-
-            for (String host : hosts) {
-                resolveHost(host, base, result);
-                if (result.size() >= MAX_BLOCKED_ROUTES) break;
-            }
-        }
+        LinkedHashSet<String> hosts = new LinkedHashSet<>();
+        hosts.add(base);
+        if (!base.startsWith("www.")) hosts.add("www." + base);
+        if (!base.startsWith("m.")) hosts.add("m." + base);
+        for (String host : hosts) resolveHost(host, base, result, 16);
         return result;
     }
 
-    private void resolveHost(String host, String baseDomain, Map<String, String> out) {
+    private void resolveHost(String host, String baseDomain, Map<String, String> out, int limit) {
         for (String resolver : new String[]{"1.1.1.1", "8.8.8.8"}) {
-            if (out.size() >= MAX_BLOCKED_ROUTES) return;
+            if (out.size() >= limit) return;
             for (int qtype : new int[]{1, 28}) {
                 try {
                     byte[] query = buildDnsLookup(host, qtype);
                     byte[] response = sendDirectDns(query, resolver);
                     if (response == null) continue;
                     for (InetAddress address : parseAddressAnswers(response)) {
-                        if (out.size() >= MAX_BLOCKED_ROUTES) return;
+                        if (out.size() >= limit) return;
                         out.put(address.getHostAddress(), baseDomain);
                     }
                 } catch (Exception ignored) {}
             }
         }
+    }
+
+    private void rememberRecentDomain(String domain) {
+        synchronized (dynamicRouteLock) {
+            recentRouteDomains.remove(domain);
+            recentRouteDomains.add(domain);
+            while (recentRouteDomains.size() > MAX_RECENT_DOMAINS) {
+                String first = recentRouteDomains.iterator().next();
+                recentRouteDomains.remove(first);
+            }
+        }
+    }
+
+    private void mergeDynamicRoutes(Map<String, String> learned) {
+        synchronized (dynamicRouteLock) {
+            for (Map.Entry<String, String> entry : learned.entrySet()) {
+                dynamicRouteCache.remove(entry.getKey());
+                dynamicRouteCache.put(entry.getKey(), entry.getValue());
+            }
+            while (dynamicRouteCache.size() > MAX_DYNAMIC_ROUTES) {
+                String first = dynamicRouteCache.keySet().iterator().next();
+                dynamicRouteCache.remove(first);
+            }
+        }
+    }
+
+    private Map<String, String> snapshotDynamicRoutes() {
+        synchronized (dynamicRouteLock) {
+            return new LinkedHashMap<>(dynamicRouteCache);
+        }
+    }
+
+    private void pruneDynamicRoutes() {
+        synchronized (dynamicRouteLock) {
+            dynamicRouteCache.entrySet().removeIf(entry -> !BlocklistStore.isBlocked(this, entry.getValue()));
+            recentRouteDomains.removeIf(domain -> !BlocklistStore.isBlocked(this, domain));
+        }
+    }
+
+    private void refreshRecentRoutesAsync() {
+        if (intentionalStop || rebuilding) return;
+        rebuilding = true;
+        resolverWorker = new Thread(() -> {
+            try {
+                List<String> domains;
+                synchronized (dynamicRouteLock) {
+                    domains = new ArrayList<>(recentRouteDomains);
+                }
+                LinkedHashMap<String, String> refreshed = new LinkedHashMap<>();
+                for (String domain : domains) {
+                    if (!BlocklistStore.isBlocked(this, domain)) continue;
+                    Map<String, String> one = resolveOneBlockedDomain(domain);
+                    for (Map.Entry<String, String> e : one.entrySet()) {
+                        if (refreshed.size() >= MAX_DYNAMIC_ROUTES) break;
+                        refreshed.put(e.getKey(), e.getValue());
+                    }
+                    if (refreshed.size() >= MAX_DYNAMIC_ROUTES) break;
+                }
+                synchronized (dynamicRouteLock) {
+                    dynamicRouteCache.clear();
+                    dynamicRouteCache.putAll(refreshed);
+                }
+                if (!intentionalStop) establishVpn(snapshotDynamicRoutes());
+            } finally {
+                rebuilding = false;
+            }
+        }, "RitmoRecentRouteRefresh");
+        resolverWorker.start();
     }
 
     private byte[] sendDirectDns(byte[] query, String resolver) {
@@ -673,8 +773,11 @@ public class DnsBlockVpnService extends VpnService {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        if (!intentionalStop && BlocklistStore.isProtectionEnabled(this)) {
-            mainHandler.postDelayed(this::rebuildVpnAsync, 800L);
+        // Fechar/remover a interface do Ritmo dos recentes não deve reconstruir a VPN.
+        // Reconstruir aqui era especialmente pesado com listas grandes e podia fazer
+        // a VPN sempre ativa aparecer como indisponível. Só recuperamos se ela realmente caiu.
+        if (!intentionalStop && BlocklistStore.isProtectionEnabled(this) && tun == null) {
+            scheduleRecovery();
         }
         super.onTaskRemoved(rootIntent);
     }

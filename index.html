@@ -45,6 +45,7 @@
 
     .native-status{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:999px;border:1px solid var(--border);font-size:.78rem;font-weight:800}.native-status.on{background:#17352f;border-color:#346a5e;color:#c9ffe9}.native-status.off{background:#351a26;border-color:#693248;color:#ffd0d9}
     .site-add{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:10px}.site-row{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid var(--border);border-radius:13px;background:#0b1728}.site-row .main{flex:1;min-width:0}.site-row b{display:block;overflow:hidden;text-overflow:ellipsis}.site-row button{flex:0 0 auto}.native-only-note{margin:10px 0 0}.vpn-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+    .blocked-list-lock{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px;border:1px solid var(--border);border-radius:14px;background:#0b1728}.blocked-list-lock .main{flex:1;min-width:0}.blocked-list-head{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}.blocked-list-meta{margin:8px 2px 10px}.blocked-list-shield{font-size:1.15rem}.blocked-list-empty{padding:12px;border:1px solid var(--border);border-radius:13px;background:#0b1728}.blocked-list-lock button{white-space:nowrap}
 
     .auth-gate{position:fixed;z-index:2200;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(3,10,18,.72);backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px)}.auth-gate.open{display:flex}.auth-card{width:min(410px,calc(100vw - 32px));max-height:calc(100dvh - 36px);overflow:auto;padding:22px;background:linear-gradient(180deg,rgba(21,36,58,.99),rgba(12,24,40,.99));border:1px solid #31506f;border-radius:24px;box-shadow:0 24px 80px #000b,0 0 0 1px rgba(116,225,189,.05)}.auth-logo{width:58px;height:58px;margin:0 auto 13px}.auth-card h2{text-align:center;margin:0 0 5px;font-size:1.4rem}.auth-card .intro{text-align:center;color:var(--muted);margin:0 0 16px;font-size:.88rem;line-height:1.45}.auth-card label{margin-top:10px}.auth-card input{background:#091526;border-color:#2a405d}.auth-links{display:flex;justify-content:center;gap:14px;flex-wrap:wrap;margin-top:12px}.auth-msg{min-height:20px;text-align:center;margin:11px 0 0}.auth-msg.ok{color:#bff7df}.auth-msg.err{color:#ffd0d9}.cloud-line{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}.cloud-line:last-child{border-bottom:0}.cloud-email{font-weight:800;overflow-wrap:anywhere}.cloud-status{font-size:.8rem;color:var(--muted)}.cloud-status.good{color:#bff7df}.cloud-status.warn{color:#ffe7a2}.backup-summary{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.backup-stat{padding:11px;border:1px solid var(--border);border-radius:13px;background:#0b1728}.backup-stat b{display:block;font-size:1.1rem}.backup-actions{display:grid;gap:8px}.sync-badge{display:inline-flex;padding:6px 9px;border-radius:999px;border:1px solid var(--border);font-size:.76rem;font-weight:800}.sync-badge.on{color:#c9ffe9;border-color:#346a5e;background:#17352f}.sync-badge.off{color:#ffe7a2;border-color:#695628;background:#352c18}
     @media(max-width:520px){.site-add{grid-template-columns:1fr}.vpn-actions{grid-template-columns:1fr}}
@@ -172,11 +173,21 @@
   <div class="section"><h2>Bloqueio de sites</h2></div>
   <div class="card" id="nativeBlockerCard">
     <div class="metric"><div><div class="tiny">Proteção do Android</div><div style="margin-top:5px"><span id="nativeVpnStatus" class="native-status off">Desativada</span></div></div><button id="nativeVpnButton" class="btn primary" onclick="toggleNativeBlocker()">Ativar proteção</button></div>
-    <p class="tiny native-only-note">A VPN local bloqueia pelo DNS e também pelos IPs resolvidos dos domínios. Ela roda separada da tela do Ritmo e não depende da Acessibilidade. O tráfego não é enviado para um servidor do Ritmo.</p>
+    <p class="tiny native-only-note">A VPN local bloqueia pelo DNS e usa uma camada de IP dinâmica apenas para tentativas recentes. Assim, listas grandes não sobrecarregam a conexão. Ela roda separada da tela do Ritmo e não depende da Acessibilidade. O tráfego não é enviado para um servidor do Ritmo.</p>
     <div class="switch"><div><b>Proteção contra impulso</b><div id="blockerPinStatus" class="tiny">Crie um PIN para dificultar a desativação e a remoção de sites.</div></div><button id="blockerPinButton" class="btn" onclick="openBlockerPinSetup()">Criar PIN</button></div>
     <label>Adicionar domínio</label>
     <div class="site-add"><input id="blockedDomainInput" inputmode="url" placeholder="Ex.: instagram.com"><button class="btn" onclick="addBlockedDomain()">＋ Adicionar</button></div>
-    <div id="blockedSitesList" class="list" style="margin-top:10px"></div>
+    <div id="blockedSitesPrivacy" style="margin-top:10px">
+      <div id="blockedSitesLocked" class="blocked-list-lock">
+        <div class="main"><b><span class="blocked-list-shield">🔒</span> Lista de sites protegida</b><div id="blockedSitesCount" class="tiny">0 sites bloqueados</div></div>
+        <button class="btn" onclick="openBlockedListUnlock()">Ver lista</button>
+      </div>
+      <div id="blockedSitesUnlocked" class="hide">
+        <div class="blocked-list-head"><input id="blockedSiteSearch" placeholder="Pesquisar domínio..." oninput="renderUnlockedBlockedSites()"><button class="btn" onclick="lockBlockedSitesList()">Minimizar</button></div>
+        <div id="blockedSitesListMeta" class="tiny blocked-list-meta"></div>
+        <div id="blockedSitesList" class="list"></div>
+      </div>
+    </div>
     <div class="vpn-actions"><button class="btn" onclick="openNativeVpnSettings()">Configurações de VPN</button><button class="btn" onclick="showDnsHelp()">Como funciona</button></div>
     <p class="tiny" style="margin-bottom:0">Para maior estabilidade, ative <b>VPN sempre ativa</b> nas configurações do Android. Esta versão usa split-tunnel: somente DNS e destinos bloqueados passam pela VPN, então não ative <b>Bloquear conexões sem VPN</b>.</p>
   </div>
@@ -239,11 +250,19 @@
   <div class="notice" style="margin-top:10px">Depois do PIN correto, há uma espera de 10 segundos antes da ação ser liberada. A ideia é criar uma pausa antes de enfraquecer a proteção.</div>
 </div></div>
 
+<div id="blockedListUnlockModal" class="modal"><div class="sheet"><div class="sheethead"><h2>Ver sites bloqueados</h2><button class="close" onclick="closeBlockedListUnlock()">✕</button></div>
+  <p class="muted">A lista fica minimizada para evitar exposição desnecessária. Digite o mesmo PIN da proteção para visualizar os domínios.</p>
+  <label>PIN da proteção</label><input id="blockedListPin" type="password" inputmode="numeric" maxlength="8" placeholder="Seu PIN" onkeydown="if(event.key==='Enter')confirmBlockedListUnlock()">
+  <button class="btn primary full" style="margin-top:12px" onclick="confirmBlockedListUnlock()">Desbloquear lista</button>
+  <p id="blockedListUnlockMsg" class="tiny"></p>
+</div></div>
+
 <script>
 const KEY='ritmo_v1', OWNER_KEY='ritmo_cloud_owner';
 const defaults={profile:{setupDone:false,lastDate:'',autoSuccessThrough:''},plan:{mode:'reduce',goalA:0,goalB:3,reason:'',action1:'Levantar, beber água e sair do ambiente.',action2:'Caminhar por 10 minutos.',action3:'Começar uma tarefa curta.'},settings:{discreet:false,pinEnabled:false,pin:'',autoSuccess:true,blockerPin:''},logs:[],createdAt:new Date().toISOString()};
 let data=load(), timerLeft=300, timerId=null, cloudTimer=null, currentUser=null, pendingBackup=null, cloudLoading=false;
 let pendingAfterPin=null, protectedBlockerAction=null, protectedCountdown=null, protectedReady=false;
+let blockedSitesCache=[], blockedSitesListUnlocked=false;
 function clone(o){return JSON.parse(JSON.stringify(o))}
 function normalizeData(x){x=x&&typeof x==='object'?x:{};return {...clone(defaults),...x,profile:{...defaults.profile,...(x.profile||{})},plan:{...defaults.plan,...(x.plan||{})},settings:{...defaults.settings,...(x.settings||{})},logs:Array.isArray(x.logs)?x.logs:[]}}
 function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'null');return x?normalizeData(x):clone(defaults)}catch(e){return clone(defaults)}}
@@ -280,7 +299,7 @@ function showWelcome(){firstLastDate.max=ymd();firstLastDate.value=data.profile.
 function finishWelcome(){const d=firstLastDate.value;if(!d){alert('Escolha a data do último dia.');return}if(d>ymd()){alert('A data não pode estar no futuro.');return}data.profile.lastDate=d;data.profile.autoSuccessThrough='';data.profile.setupDone=true;data.plan.mode=firstMode.value;persist();welcome.classList.remove('open');renderAll()}
 function openStartDateEditor(){editLastDate.max=ymd();editLastDate.value=data.profile.lastDate||ymd();openModal('startDateModal')}
 function saveStartDate(){const d=editLastDate.value;if(!d||d>ymd()){alert('Escolha uma data válida.');return}data.profile.lastDate=d;data.profile.autoSuccessThrough='';data.profile.setupDone=true;persist();closeModal('startDateModal');ensureAutomaticSuccessDays();renderAll()}
-function go(id){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.page===id));if(id==='stats')renderStats();if(id==='log')renderHistory();window.scrollTo({top:0,behavior:'smooth'})}
+function go(id){if(id!=='settings')lockBlockedSitesList(false);document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===id));document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.page===id));if(id==='stats')renderStats();if(id==='log')renderHistory();window.scrollTo({top:0,behavior:'smooth'})}
 function openModal(id){document.getElementById(id).classList.add('open')} function closeModal(id){document.getElementById(id).classList.remove('open')}
 function quickLog(type){go('log');logType.value=type;logDate.value=ymd();logDate.max=ymd();target.value=(type==='slip')?'both':'none'}
 function quickVictory(){data.logs.push({id:Date.now(),type:'urge',date:ymd(),target:'none',trigger:'Vontade superada',intensity:0,feeling:'',notes:'Registro rápido',createdAt:new Date().toISOString()});persist();renderAll()}
@@ -343,21 +362,54 @@ window.onRitmoCloudLoaded=function(ok,exists,dataJson,sitesJson,message){cloudLo
 window.onRitmoCloudSaved=function(ok,message){setCloudStatus(message|| (ok?'Sincronizado.':'Não foi possível sincronizar.'),ok?'good':'warn');renderAccount()}
 
 function hasNativeBlocker(){return typeof window.RitmoAndroid!=='undefined'&&typeof window.RitmoAndroid.getBlockedSites==='function'}
+function blockedSitesCountText(n){return n===1?'1 site bloqueado':n+' sites bloqueados'}
+function lockBlockedSitesList(closeUnlockModal=true){
+  blockedSitesListUnlocked=false;
+  const u=document.getElementById('blockedSitesUnlocked'),l=document.getElementById('blockedSitesLocked'),q=document.getElementById('blockedSiteSearch');
+  if(u)u.classList.add('hide');if(l)l.classList.remove('hide');if(q)q.value='';
+  if(closeUnlockModal)closeBlockedListUnlock();
+}
+function openBlockedListUnlock(){
+  if(!data.settings.blockerPin){openBlockerPinSetup({type:'viewList'});return}
+  blockedListPin.value='';blockedListUnlockMsg.textContent='';openModal('blockedListUnlockModal');setTimeout(()=>blockedListPin.focus(),120)
+}
+function closeBlockedListUnlock(){blockedListPin.value='';blockedListUnlockMsg.textContent='';closeModal('blockedListUnlockModal')}
+function confirmBlockedListUnlock(){
+  const p=blockedListPin.value.replace(/\D/g,'');
+  if(p!==String(data.settings.blockerPin||'')){blockedListUnlockMsg.textContent='PIN incorreto.';return}
+  blockedSitesListUnlocked=true;closeBlockedListUnlock();renderBlockedSitesPrivacy();
+}
+function renderBlockedSitesPrivacy(){
+  const locked=document.getElementById('blockedSitesLocked'),unlocked=document.getElementById('blockedSitesUnlocked'),count=document.getElementById('blockedSitesCount');
+  if(count)count.textContent=blockedSitesCountText(blockedSitesCache.length);
+  if(!locked||!unlocked)return;
+  locked.classList.toggle('hide',blockedSitesListUnlocked);unlocked.classList.toggle('hide',!blockedSitesListUnlocked);
+  if(blockedSitesListUnlocked)renderUnlockedBlockedSites();
+}
+function renderUnlockedBlockedSites(){
+  const list=document.getElementById('blockedSitesList'),meta=document.getElementById('blockedSitesListMeta');if(!list||!meta)return;
+  const q=(document.getElementById('blockedSiteSearch')?.value||'').trim().toLowerCase();
+  const filtered=q?blockedSitesCache.filter(s=>s.toLowerCase().includes(q)):blockedSitesCache;
+  const limit=150,visible=filtered.slice(0,limit);
+  meta.textContent=q?`${filtered.length} resultado(s) · mostrando até ${limit}`:`${blockedSitesCache.length} site(s) protegido(s) · mostrando até ${limit}. Use a busca para encontrar outros.`;
+  list.innerHTML=visible.length?visible.map(s=>`<div class="site-row"><div class="main"><b>🚫 ${esc(s)}</b><div class="tiny">Inclui subdomínios</div></div><button class="close" onclick='removeBlockedDomain(${JSON.stringify(s)})'>×</button></div>`).join(''):'<div class="blocked-list-empty"><b>Nenhum domínio encontrado</b><div class="tiny">Tente outra busca.</div></div>';
+}
 function refreshNativeBlocker(){
   const card=document.getElementById('nativeBlockerCard');if(!card)return;
   const status=document.getElementById('nativeVpnStatus'),btn=document.getElementById('nativeVpnButton'),list=document.getElementById('blockedSitesList');
   if(!hasNativeBlocker()){
-    status.textContent='Somente no app Android';status.className='native-status off';btn.disabled=true;btn.textContent='Indisponível no PWA';
-    list.innerHTML='<div class="item"><div class="main"><b>Recurso nativo</b><p>Instale a versão Android do Ritmo para usar o bloqueio de sites.</p></div></div>';return;
+    blockedSitesCache=[];status.textContent='Somente no app Android';status.className='native-status off';btn.disabled=true;btn.textContent='Indisponível no PWA';
+    if(list)list.innerHTML='<div class="item"><div class="main"><b>Recurso nativo</b><p>Instale a versão Android do Ritmo para usar o bloqueio de sites.</p></div></div>';renderBlockedSitesPrivacy();return;
   }
   let active=false,sites=[];try{active=!!window.RitmoAndroid.isVpnActive();sites=JSON.parse(window.RitmoAndroid.getBlockedSites()||'[]')}catch(e){}
-  status.textContent=active?'Ativada • DNS + IP':'Desativada';status.className='native-status '+(active?'on':'off');btn.textContent=active?'Desativar proteção':'Ativar proteção';btn.classList.toggle('danger',active);btn.classList.toggle('primary',!active);
-  list.innerHTML=sites.length?sites.map(s=>`<div class="site-row"><div class="main"><b>🚫 ${esc(s)}</b><div class="tiny">Inclui subdomínios</div></div><button class="close" onclick='removeBlockedDomain(${JSON.stringify(s)})'>×</button></div>`).join(''):'<div class="item"><div class="main"><b>Nenhum site bloqueado</b><p>Adicione um domínio acima, sem precisar escrever https://.</p></div></div>';
+  blockedSitesCache=Array.isArray(sites)?sites:[];
+  status.textContent=active?'Ativada • DNS + IP dinâmico':'Desativada';status.className='native-status '+(active?'on':'off');btn.textContent=active?'Desativar proteção':'Ativar proteção';btn.classList.toggle('danger',active);btn.classList.toggle('primary',!active);
+  renderBlockedSitesPrivacy();
 }
-function updateBlockerPinUi(){const b=document.getElementById('blockerPinButton'),s=document.getElementById('blockerPinStatus');if(!b||!s)return;const set=!!data.settings.blockerPin;b.textContent=set?'Alterar PIN':'Criar PIN';s.textContent=set?'PIN configurado. Desligar a VPN, remover sites ou apagar os dados exige o PIN e 10 segundos de espera.':'Crie um PIN para dificultar a desativação e a remoção de sites.'}
+function updateBlockerPinUi(){const b=document.getElementById('blockerPinButton'),s=document.getElementById('blockerPinStatus');if(!b||!s)return;const set=!!data.settings.blockerPin;b.textContent=set?'Alterar PIN':'Criar PIN';s.textContent=set?'PIN configurado. Ele protege a visualização da lista e, com 10 segundos de espera, a desativação, remoção de sites e limpeza de dados.':'Crie um PIN para proteger a lista e dificultar a desativação e a remoção de sites.'}
 function cancelBlockerPinSetup(){pendingAfterPin=null;closeModal('blockerPinSetupModal');blockerPinSetupMsg.textContent='';blockerCurrentPin.value='';blockerNewPin.value='';blockerNewPin2.value=''}
 function openBlockerPinSetup(afterAction=null){pendingAfterPin=afterAction;blockerCurrentPinWrap.classList.toggle('hide',!data.settings.blockerPin);blockerCurrentPin.value='';blockerNewPin.value='';blockerNewPin2.value='';blockerPinSetupMsg.textContent='';openModal('blockerPinSetupModal')}
-function saveBlockerPin(){const oldPin=String(data.settings.blockerPin||''),current=blockerCurrentPin.value.replace(/\D/g,''),p=blockerNewPin.value.replace(/\D/g,''),p2=blockerNewPin2.value.replace(/\D/g,'');if(oldPin&&current!==oldPin){blockerPinSetupMsg.textContent='PIN atual incorreto.';return}if(p.length<4||p.length>8){blockerPinSetupMsg.textContent='Use de 4 a 8 números.';return}if(p!==p2){blockerPinSetupMsg.textContent='Os novos PINs não coincidem.';return}data.settings.blockerPin=p;persist();const next=pendingAfterPin;pendingAfterPin=null;closeModal('blockerPinSetupModal');blockerCurrentPin.value='';blockerNewPin.value='';blockerNewPin2.value='';updateBlockerPinUi();if(next){setTimeout(()=>{if(next.type==='enable')startNativeProtection();else openProtectedBlockerAction(next.type,next.value||'')},160)}else alert('PIN da proteção salvo.')}
+function saveBlockerPin(){const oldPin=String(data.settings.blockerPin||''),current=blockerCurrentPin.value.replace(/\D/g,''),p=blockerNewPin.value.replace(/\D/g,''),p2=blockerNewPin2.value.replace(/\D/g,'');if(oldPin&&current!==oldPin){blockerPinSetupMsg.textContent='PIN atual incorreto.';return}if(p.length<4||p.length>8){blockerPinSetupMsg.textContent='Use de 4 a 8 números.';return}if(p!==p2){blockerPinSetupMsg.textContent='Os novos PINs não coincidem.';return}data.settings.blockerPin=p;persist();lockBlockedSitesList(false);const next=pendingAfterPin;pendingAfterPin=null;closeModal('blockerPinSetupModal');blockerCurrentPin.value='';blockerNewPin.value='';blockerNewPin2.value='';updateBlockerPinUi();if(next){setTimeout(()=>{if(next.type==='enable')startNativeProtection();else if(next.type==='viewList')openBlockedListUnlock();else openProtectedBlockerAction(next.type,next.value||'')},160)}else alert('PIN da proteção salvo.')}
 function startNativeProtection(){if(!hasNativeBlocker())return;try{window.RitmoAndroid.requestVpnPermission();setTimeout(refreshNativeBlocker,700)}catch(e){alert('Não foi possível ativar a proteção.')}}
 function toggleNativeBlocker(){if(!hasNativeBlocker())return;try{const active=!!window.RitmoAndroid.isVpnActive();if(active){openProtectedBlockerAction('disable');return}if(!data.settings.blockerPin){openBlockerPinSetup({type:'enable'});return}startNativeProtection()}catch(e){alert('Não foi possível alterar a proteção.')}}
 function addBlockedDomain(){if(!hasNativeBlocker())return;const el=document.getElementById('blockedDomainInput'),v=(el.value||'').trim();if(!v){alert('Digite um domínio, por exemplo instagram.com.');return}try{const ok=window.RitmoAndroid.addBlockedSite(v);if(!ok){alert('Use um domínio válido, por exemplo instagram.com.');return}el.value='';refreshNativeBlocker()}catch(e){alert('Não foi possível adicionar este domínio.')}}
@@ -370,6 +422,7 @@ function openNativeVpnSettings(){if(hasNativeBlocker())window.RitmoAndroid.openV
 function showDnsHelp(){alert('Esta versão não depende da Acessibilidade. O Ritmo filtra o DNS e também resolve os domínios bloqueados para capturar seus IPs diretamente pela VPN. Isso ajuda mesmo com cache e DNS Seguro. Para manter a proteção após fechar o app, use VPN sempre ativa. Como a VPN é split-tunnel, não ative “Bloquear conexões sem VPN”.')}
 
 function renderAll(){logDate.value=ymd();logDate.max=ymd();renderPlan();renderHome();renderHistory();renderStats();applySettings();refreshNativeBlocker();renderAccount()}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)lockBlockedSitesList(false)});window.addEventListener('pagehide',()=>lockBlockedSitesList(false));
 document.addEventListener('DOMContentLoaded',()=>{today.textContent=new Intl.DateTimeFormat('pt-BR',{weekday:'long',day:'2-digit',month:'long'}).format(new Date());const last=localStorage.getItem('ritmo_last_email');if(last)authEmail.value=last;ensureAutomaticSuccessDays();renderAll();if(!data.profile.setupDone||!data.profile.lastDate)showWelcome();else if(data.settings.pinEnabled&&data.settings.pin)lock.classList.add('open');bootstrapAuth();if(location.protocol!=='file:'&&'serviceWorker'in navigator)navigator.serviceWorker.register('./service-worker.js').catch(()=>{})});
 </script>
 </body>
